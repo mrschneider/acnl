@@ -61,7 +61,7 @@ from .sequencing import (
     SequenceError,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "PROTOCOL_MAJOR",
