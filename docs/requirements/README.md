@@ -82,3 +82,27 @@ communication layer. The requirements are stated as *what must hold*, not
 - **R9.3** The E2E driver is written in a language different from the
   server: a Python client talking to a Python server proves nothing about
   portability.
+
+## R10 — Federation
+
+- **R10.1** Brokers link as peers with a broker-role hello; registration of
+  the link is implicit (no dedicated register message).
+- **R10.2** On link, the answering side pushes its whole live directory
+  table as notifications (the router's table).
+- **R10.3** Learned entries propagate hop by hop on the periodic table
+  broadcast, excluding the peer that taught the entry — sending it back is
+  an echo, not propagation.
+- **R10.4** An event about a locally known agent or about the broker's own
+  urn is a reverb: it is ignored, never clobbering the local mapping.
+- **R10.5** Resolve answers locally first; on a local miss the federated
+  table answers, and the reply marks `origin: "federated"`.
+- **R10.6** A federated query merges the learned table into the result,
+  deduped by urn, with the local entry winning on conflicts.
+- **R10.7** Replies route by the envelope's recipient through the federated
+  table when the recipient is not directly connected — never by request id.
+- **R10.8** A peer going down takes its table with it: its entries are
+  evicted locally and the eviction is broadcast (a router's loss is
+  announced, not discovered by timeout alone).
+- **R10.9** An explicit withdraw of the agent's own name wins over its
+  implicit registration; a withdraw of a name carried by a peer link must
+  not desync the federation.

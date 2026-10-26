@@ -91,6 +91,7 @@ class Connection:
     tracker: ConnectionTracker = None
     sender: Optional[str] = None  # learned from the first hello
     capabilities: List[str] = None
+    is_peer: bool = False  # broker-to-broker link (federation)
     dead: bool = False
     closed_reason: str = None
 
@@ -118,6 +119,7 @@ class Node:
         self.directory = directory or InMemoryDirectory()
         self.conns: Dict[str, Connection] = {}
         self.remote_agents: Dict[str, str] = {}  # urn -> conn_id that advertised it
+        self.remote_directory: Dict[str, Tuple[Dict[str, Any], str]] = {}  # urn -> (reference, conn_id)
         self._seen: deque = deque(maxlen=1024)  # dedupe window
         self._seen_set: set = set()
         self._lock = threading.RLock()
@@ -171,6 +173,38 @@ class Node:
         except OSError:
             pass
         conn.dead = True
+
+    def peer(self, host: str, port: int, timeout: float = 5.0) -> None:
+        """Link to another broker as a federation peer. Registration is
+        implicit: the link is a hello with role=broker, and the answering
+        side pushes its whole directory table as notify frames."""
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(0.5)
+        cid = new_id()
+        conn = Connection(
+            conn_id=cid,
+            node=self,
+            sock=sock,
+            addr=(host, port),
+            queue=deque(),
+            queue_depth=self.cfg.queue_depth,
+            writer=None,
+            is_peer=True,
+        )
+        writer = threading.Thread(target=self._writer_loop, args=(conn,), daemon=True)
+        conn.writer = writer
+        with self._lock:
+            self.conns[cid] = conn
+        reader = threading.Thread(target=self._reader_loop, args=(conn,), daemon=True)
+        reader.start()
+        writer.start()
+        conn.push(
+            WireMessage(
+                kind="hello",
+                envelope=make_envelope(sender=self.cfg.self_urn, recipient="acnl:peer/peer/broker"),
+                body={"role": "broker", "capabilities": ["directory", "broker"]},
+            )
+        )
 
     def _accept_loop(self) -> None:
         while not self._stop:
@@ -232,12 +266,21 @@ class Node:
             for value, _ in frames:
                 self._handle_frame(conn, value)
         conn.dead = True
+        evicted: List[str] = []
         with self._lock:
             self.conns.pop(conn.conn_id, None)
-            # drop remote agents this connection advertised
+            # drop the entries this connection carried (its own agents and
+            # everything its side of the federation advertised): a router
+            # going down takes its table with it and the loss is announced
             for urn, cid in list(self.remote_agents.items()):
                 if cid == conn.conn_id:
                     del self.remote_agents[urn]
+            for urn, (_ref, cid) in list(self.remote_directory.items()):
+                if cid == conn.conn_id:
+                    del self.remote_directory[urn]
+                    evicted.append(urn)
+        for urn in evicted:
+            self._broadcast_to_peers(conn, "withdrawn", urn, None)
 
     # ------------------------------------------------------------------
     # frame handling
@@ -276,26 +319,76 @@ class Node:
         return malformed(text)
 
     def _handle_hello(self, conn: Connection, msg: WireMessage) -> None:
-        if conn.sender is None:
+        body = msg.body or {}
+        is_new = conn.sender is None
+        if is_new:
             conn.sender = msg.envelope.sender
-            conn.capabilities = list((msg.body or {}).get("capabilities", []))
+            conn.capabilities = list(body.get("capabilities", []))
+            conn.is_peer = body.get("role") == "broker"
             conn.tracker.transition(ConnectionState.ESTABLISHED)
-        conn.push(
-            WireMessage(
-                kind="hello",
-                envelope=make_envelope(
-                    sender=self.cfg.self_urn,
-                    recipient=msg.envelope.sender,
-                    request_id=msg.envelope.request_id,
-                    message_id=new_id(),
-                ),
-                body={
-                    "urn": self.cfg.self_urn,
-                    "capabilities": ["directory", "broker"],
-                    "protocol_version": acnl_core.PROTOCOL_VERSION,
-                },
+            # answer the greeting exactly once: replying to every hello makes
+            # two peers ping-pong hello replies forever
+            conn.push(
+                WireMessage(
+                    kind="hello",
+                    envelope=make_envelope(
+                        sender=self.cfg.self_urn,
+                        recipient=msg.envelope.sender,
+                        request_id=msg.envelope.request_id,
+                        message_id=new_id(),
+                    ),
+                    body={
+                        "urn": self.cfg.self_urn,
+                        "role": "broker",
+                        "capabilities": ["directory", "broker"],
+                        "protocol_version": acnl_core.PROTOCOL_VERSION,
+                    },
+                )
             )
-        )
+        if is_new and conn.is_peer:
+            # a router that just linked is told the whole table (the router's
+            # table, broadcast federation), including this broker itself
+            for ref in self.directory.snapshot():
+                conn.push(
+                    WireMessage(
+                        kind="notify",
+                        envelope=make_envelope(
+                            sender=self.cfg.self_urn,
+                            recipient=conn.sender,
+                            request_id=new_id(),
+                            message_id=new_id(),
+                        ),
+                        body={"event": "registered", "urn": ref.urn, "reference": ref.to_dict()},
+                    )
+                )
+        if is_new and not conn.is_peer:
+            # implicit registration propagates: a reply addressed to this
+            # agent must be routable from a peer broker two hops away
+            with self._lock:
+                self.remote_agents[conn.sender] = conn.conn_id
+                self.remote_directory[conn.sender] = (
+                    {
+                        "urn": conn.sender,
+                        "endpoints": [f"{body.get('host', 'unknown')}:{body.get('port', 0)}"]
+                        if body.get("port")
+                        else [],
+                        "protocol_version": acnl_core.PROTOCOL_VERSION,
+                        "capabilities": list(conn.capabilities or []),
+                        "attributes": {},
+                    },
+                    conn.conn_id,
+                )
+            from acnl_core.addresses import Reference
+
+            self._broadcast_to_peers(
+                conn,
+                "registered",
+                conn.sender,
+                Reference(
+                    urn=conn.sender,
+                    capabilities=list(conn.capabilities or []),
+                ),
+            )
 
     def _handle_request(self, conn: Connection, msg: WireMessage) -> None:
         # loop safety: refuse when this node is already in the route
@@ -375,6 +468,12 @@ class Node:
         self.directory.unbind(urn)
         with self._lock:
             self.remote_agents.pop(urn, None)
+            # an explicit withdraw wins over the implicit registration the
+            # agent got at hello — but only the owner's own entry: withdrawing
+            # a name carried by a peer link must not desync the federation
+            entry = self.remote_directory.get(urn)
+            if entry is not None and entry[1] == conn.conn_id:
+                self.remote_directory.pop(urn, None)
         self._reply(conn, msg, body={"op": "withdraw", "urn": urn})
         self._broadcast_to_peers(conn, "withdrawn", urn, None)
 
@@ -402,15 +501,41 @@ class Node:
     def _op_resolve(self, conn: Connection, msg: WireMessage) -> None:
         urn = msg.body["urn"]
         ref = self.directory.resolve(urn)
-        if ref is None:
+        if ref is not None:
+            self._reply(conn, msg, body={"op": "resolve", "urn": urn, "reference": ref.to_dict()})
+            return
+        # local miss: the federated table (learned from peer brokers)
+        with self._lock:
+            entry = self.remote_directory.get(urn)
+        if entry is None:
             _err(conn, msg.envelope.sender, unknown_service(urn), msg.envelope.request_id)
             return
-        self._reply(conn, msg, body={"op": "resolve", "urn": urn, "reference": ref.to_dict()})
+        self._reply(
+            conn, msg, body={"op": "resolve", "urn": urn, "reference": entry[0], "origin": "federated"}
+        )
 
     def _op_query(self, conn: Connection, msg: WireMessage) -> None:
         text = msg.body["filter"]
         ast = parse_query(text)
         refs = self.directory.query(ast)
+        # federation: merge the remote table into the result, deduped by urn
+        # (a local entry always wins — it is the one this broker can answer for)
+        seen = {r.urn for r in refs}
+        with self._lock:
+            remote = [d for (d, _cid) in self.remote_directory.values()]
+        from acnl_core.addresses import Reference
+
+        for d in remote:
+            if d and d.get("urn") not in seen:
+                try:
+                    cand = Reference.from_dict(d)
+                except Exception:
+                    continue
+                import acnl_core.attributes as _attrs
+
+                if _attrs._eval(ast, cand.to_dict()):
+                    refs.append(cand)
+                    seen.add(cand.urn)
         self._reply(
             conn, msg, body={"op": "query", "filter": text, "references": [r.to_dict() for r in refs]}
         )
@@ -424,24 +549,42 @@ class Node:
     # replies, notifications, fragments
 
     def _handle_reply(self, conn: Connection, msg: WireMessage) -> None:
-        # route by the envelope's recipient, never by request_id
+        # route by the envelope's recipient, never by request_id. A directly
+        # connected recipient goes straight; otherwise the federated table
+        # says which peer link carries the recipient's side of the network.
         recipient = msg.envelope.recipient
         target = self.conns_by_sender().get(recipient)
+        if target is None:
+            with self._lock:
+                cid = self.remote_agents.get(recipient)
+            target = self.conns.get(cid) if cid else None
         if target is None:
             _err(conn, msg.envelope.sender, target_unreachable(recipient), msg.envelope.request_id)
             return
         self._forward(conn, msg, target)
 
     def _handle_notify(self, conn: Connection, msg: WireMessage) -> None:
-        # a notification from a peer about an advertised/withdrawn service
+        # a notification from a peer about an advertised/withdrawn service.
+        # Loop guard: an event about something we know locally (our own
+        # agents, our own urn) is a reverb of our own broadcast — ignore it
+        # entirely, do not clobber the local mapping and do not rebroadcast.
         event = msg.body["event"]
         urn = msg.body["urn"]
+        # the echo guard covers only LOCAL agents and our own urn — a peer
+        # broker's urn is also a conn sender, but its snapshot entry is the
+        # one thing we must import, not swallow
+        local_senders = {c.sender for c in self.conns.values() if c.sender and not c.is_peer}
+        known = urn == self.cfg.self_urn or urn in local_senders
+        if known:
+            return
         if event == "registered":
             with self._lock:
                 self.remote_agents[urn] = conn.conn_id
+                self.remote_directory[urn] = (msg.body.get("reference"), conn.conn_id)
         elif event == "withdrawn":
             with self._lock:
                 self.remote_agents.pop(urn, None)
+                self.remote_directory.pop(urn, None)
         self._broadcast_to_peers(conn, event, urn, msg.body.get("reference"))
 
     def _handle_fragment(self, conn: Connection, msg: WireMessage) -> None:
@@ -506,14 +649,20 @@ class Node:
             )
         )
 
-    def _broadcast_to_peers(self, origin: Optional["Connection"], event: str, urn: str, ref) -> None:
+    def _broadcast_to_peers(
+        self, origin: Optional["Connection"], event: str, urn: str, ref, peers_only: bool = False
+    ) -> None:
         from acnl_core.addresses import Reference
 
         origin_id = origin.conn_id if origin is not None else None
         with self._lock:
-            peers = [c for c in self.conns.values() if c.conn_id != origin_id]
+            targets = [
+                c
+                for c in self.conns.values()
+                if c.conn_id != origin_id and (c.is_peer if peers_only else True)
+            ]
         body = {"event": event, "urn": urn, "reference": ref.to_dict() if isinstance(ref, Reference) else ref}
-        for peer in peers:
+        for peer in targets:
             peer.push(
                 WireMessage(
                     kind="notify",
@@ -551,3 +700,14 @@ class Node:
             return
         self.directory.advertise(self.cfg.self_urn, ref, self.cfg.directory_ttl)
         self._broadcast_to_peers(None, "registered", self.cfg.self_urn, ref)
+        # federation: re-broadcast the learned table so entries propagate
+        # hop by hop (a router that linked after the original announcement
+        # still converges), excluding the peer that taught us the entry —
+        # sending it back is an echo, not propagation
+        with self._lock:
+            learned = [(urn, d, cid) for urn, (d, cid) in self.remote_directory.items()]
+        for urn, d, cid in learned:
+            origin = self.conns.get(cid)
+            if origin is None:
+                continue
+            self._broadcast_to_peers(origin, "registered", urn, d, peers_only=True)

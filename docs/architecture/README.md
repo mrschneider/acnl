@@ -76,6 +76,21 @@ Two layers, never fused:
   durable backend is a gap list item.
 - **Peers**: `acnl_engine.node` is the reference participant. Any
   framework that speaks the wire format can peer with it.
+- **Broker federation** (`Node.peer(host, port)`): broadcast federation —
+  no routing protocol, no directory merge daemon. A peer link is a
+  broker-role hello; the answering side pushes its whole live table as
+  notify frames; learned entries propagate hop by hop on the periodic
+  table broadcast, excluding the peer that taught the entry. The echo
+  guard ignores any event about a locally known agent or about the
+  broker's own urn — a reverb never clobbers the local mapping. Resolve
+  answers locally first, then from the federated table (marked
+  `origin: "federated"`); queries merge and dedupe by urn with the local
+  entry winning. Replies route by recipient through the federated table
+  when the recipient is not directly connected. A peer going down takes
+  its table with it: entries evicted, eviction announced. An explicit
+  withdraw of the agent's own name wins over its implicit registration.
+  No new wire kind, no new operation — federation rides entirely on
+  hello/notify, so it is a minor version.
 
 ## Wire format
 
