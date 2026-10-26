@@ -5,6 +5,37 @@ All notable changes to this project are documented here. The format follows
 the protocol's own policy (R8): a different major is refused on the wire, a
 different minor is accepted as additive.
 
+## [0.2.0] — 2026-10-26
+
+### Added
+
+- Broker federation (`Node.peer(host, port)`): broker-to-broker peer links;
+  on link the answering side pushes its whole live directory table as
+  notifications; learned entries propagate hop by hop on the periodic table
+  broadcast (excluding the peer that taught the entry — an echo is not
+  propagation); echo guard ignoring events about locally known agents and
+  the broker's own urn; federated resolve (`origin: "federated"`) and
+  federated query merge deduped by urn with the local entry winning;
+  replies routed by recipient through the federated table; eviction of a
+  dead peer's entries with the loss announced.
+- `Directory.snapshot()`: the live table for a peer that just linked, on
+  both adapters.
+- Implicit registration now propagates across the federation, so replies
+  are routable two hops away.
+
+### Changed
+
+- An explicit `withdraw` of the agent's own name now also removes its
+  implicit registration (an explicit withdraw wins over hello-time
+  registration); withdrawing a name carried by a peer link does not
+  desync the federation.
+- A hello is answered exactly once per connection: replying to every
+  hello made two broker peers ping-pong hello replies forever.
+
+### Verified
+
+- 64 tests passing (6 new federation tests), 11/11 cross-language E2E.
+
 ## [0.1.0] — 2026-10-26
 
 ### Added
