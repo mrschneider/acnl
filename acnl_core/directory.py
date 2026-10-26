@@ -37,6 +37,7 @@ class Directory(Protocol):
     def query(self, ast: Any) -> List[Reference]: ...
     def advertise(self, urn: str, reference: Reference, ttl: float) -> None: ...
     def sweep(self, now: Optional[float] = None) -> List[str]: ...
+    def snapshot(self) -> List[Reference]: ...
 
 
 class InMemoryDirectory:
@@ -82,6 +83,11 @@ class InMemoryDirectory:
 
     def count(self) -> int:
         return len(self._entries)
+
+    def snapshot(self) -> List[Reference]:
+        """Every live entry, for a peer that just linked (the router's table)."""
+        now = time.time()
+        return [e.reference for e in self._entries.values() if e.expires_at is None or e.expires_at > now]
 
 
 class DuplicateName(ValueError):
@@ -154,6 +160,10 @@ class ShelveDirectory:
 
     def count(self) -> int:
         return len(self._load())
+
+    def snapshot(self) -> List[Reference]:
+        now = time.time()
+        return [e.reference for e in self._load().values() if e.expires_at is None or e.expires_at > now]
 
     def close(self) -> None:
         self._store.close()
