@@ -72,12 +72,17 @@ def test_live_advertise_propagates_through_peer_link(two_peered):
     c2 = Client("acnl:lab/node2/clock")
     try:
         c2.connect("127.0.0.1", n2._listener.getsockname()[1])
-        # advertised AFTER the link: the notify broadcast must reach n1
+        # advertised AFTER the link: the notify broadcast must reach n1.
+        # Wait for the ADVERTISE entry, not just any entry for the urn —
+        # the implicit registration (no capabilities) lands first, and
+        # reading it would race the advertise notification
         c2.advertise("acnl:lab/node2/clock", _ref("acnl:lab/node2/clock", capabilities=["time"]))
         c1 = Client("acnl:lab/node1/worker")
         try:
             c1.connect("127.0.0.1", n1._listener.getsockname()[1])
-            assert _wait(lambda: "acnl:lab/node2/clock" in n1.remote_directory)
+            assert _wait(
+                lambda: (n1.remote_directory.get("acnl:lab/node2/clock", (None,))[0] or {}).get("capabilities") == ["time"]
+            )
             got = c1.resolve("acnl:lab/node2/clock")
             assert got["origin"] == "federated"
             assert got["reference"]["capabilities"] == ["time"]
