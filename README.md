@@ -1,6 +1,11 @@
 # Agent Communication Network Layer (ACNL)
 
-**Status:** v0.1 · **Language:** Python 3.10+ (stdlib only) · **Interop driver:** Node.js
+[![CI](https://github.com/mrschneider/acnl/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/acnl/actions/workflows/ci.yml)
+[![Release](https://github.com/mrschneider/acnl/actions/workflows/release.yml/badge.svg)](https://github.com/mrschneider/acnl/actions/workflows/release.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+**Status:** v0.1.0 · **Language:** Python 3.10+ (stdlib only) · **Interop driver:** Node.js
 
 ## What it is
 
