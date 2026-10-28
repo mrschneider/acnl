@@ -31,6 +31,7 @@ from acnl_core.messages import (
     make_envelope,
     new_id,
 )
+from acnl_core.security import SecurityError
 
 from .config import NodeConfig
 
@@ -52,12 +53,14 @@ class SystemErrorReply(Exception):
 
 
 class Client:
-    def __init__(self, agent_urn: str, fragment_size: int = 4096):
+    def __init__(self, agent_urn: str, fragment_size: int = 4096, security=None):
         from acnl_core.addresses import parse_urn
 
         parse_urn(agent_urn)
         self.agent_urn = agent_urn
         self.fragment_size = fragment_size
+        self.security = security  # acnl_core.security.SecurityPolicy | None
+        self.rejected_auth = 0  # frames refused by the reader (tests + ops)
         self.sock: Optional[socket.socket] = None
         self.decoder = FrameDecoder()
         self.request_id = None
@@ -165,7 +168,10 @@ class Client:
         sock = self.sock
         if sock is None:
             raise RuntimeError("client is not connected")
-        sock.sendall(encode_frame(msg.to_value()))
+        value = msg.to_value()
+        if self.security is not None:
+            value = self.security.protect(value)
+        sock.sendall(encode_frame(value))
 
     def _wait_reply(self, req_id: str, timeout: float) -> WireMessage:
         deadline = time.time() + timeout
@@ -192,6 +198,14 @@ class Client:
             except CodecError:
                 break
             for value, _ in frames:
+                if self.security is not None:
+                    try:
+                        value = self.security.unprotect(value)
+                    except SecurityError:
+                        # no error channel yet: refuse the frame, keep the
+                        # connection (mirrors the node's fail-closed reader)
+                        self.rejected_auth += 1
+                        continue
                 try:
                     msg = WireMessage.from_value(value)
                 except MessageError:

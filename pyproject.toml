@@ -14,6 +14,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+security = ["cryptography>=41"]
 
 [tool.setuptools.packages.find]
 include = ["acnl_core*", "acnl_engine*"]

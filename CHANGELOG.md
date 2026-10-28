@@ -5,6 +5,47 @@ All notable changes to this project are documented here. The format follows
 the protocol's own policy (R8): a different major is refused on the wire, a
 different minor is accepted as additive.
 
+## [Unreleased]
+
+### Added
+
+- **Security (opt-in)** — `acnl_core.security.SecurityPolicy` wired through
+  `NodeConfig.security` / `Client(security=...)`: per-hop HMAC-SHA256 frame
+  authentication (stdlib), optional AES-256-GCM body sealing
+  (`acnl[security]` extra; `op` stays visible for broker routing, AAD binds
+  kind + origin sender), and a default-deny ACL (`sender`/`ops`/`recipient`
+  fnmatch rules) checked at the routing entrance on every hop. Refusals are
+  typed user errors (`auth_failed`, `not_authorized`) that echo the
+  caller's request_id; verify/open failures happen before parsing so the
+  connection stays open.
+- **Datagram plane** — `acnl_engine.datagram.UdpLink`: the sequenced
+  contract end-to-end over UDP (data/ack + retransmit via `SendWindow`,
+  ordered delivery + duplicate/gap refusal via `ReceiveWindow`, contract
+  state machine, hard caps, per-datagram HMAC), with end-to-end tests over
+  real sockets.
+- **Asyncio node** — `acnl_engine.async_node.AsyncNode`: same wire,
+  refusals, routing, federation, security, and persistence semantics as
+  the threaded `Node`, on one event loop (bounded `asyncio.Queue` per
+  connection, no shared-state locks). Tested against the threaded client
+  and federating with the threaded node.
+- **Node-level persistence** — `NodeConfig.data_path` wires a
+  file-backed `ShelveDirectory` into either node; `stop()` closes what it
+  opened. `ShelveDirectory` is now safe under the node's threads:
+  per-thread handles (the 3.13+ default backend is thread-affine SQLite)
+  serialized by one lock.
+- `docs/requirements`: R11 (security), R12 (datagram plane), R13
+  (async parity).
+
+### Changed
+
+- Refusals emitted before/while parsing (codec, authentication, message
+  validation) now echo the sender's `request_id` when it is well-formed,
+  so a waiting caller can match its own refusal instead of timing out;
+  hostile garbage still falls back to a fresh id.
+- README gap list rewritten: the three former "deliberately not
+  implemented" bullets are now implemented and documented with their
+  honest remaining scope.
+
 ## [0.2.0] — 2026-10-26
 
 ### Added

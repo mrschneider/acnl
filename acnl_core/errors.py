@@ -25,6 +25,8 @@ USER_CODES = (
     "bad_operation",
     "duplicate_name",
     "denied",
+    "auth_failed",
+    "not_authorized",
     "loop_detected",
     "version_mismatch",
     "hops_exhausted",
@@ -136,3 +138,14 @@ def duplicate_name(urn: str) -> ErrorBody:
 
 def malformed(reason: str) -> ErrorBody:
     return ErrorBody(code="malformed_frame", message=f"malformed frame: {reason}")
+
+
+def authentication_failed(reason: str) -> ErrorBody:
+    """The frame did not authenticate (missing/bad MAC, bad ciphertext).
+    A user refusal: same input, same result — never retryable."""
+    return ErrorBody(code="auth_failed", message=f"authentication failed: {reason}")
+
+
+def not_authorized(detail: str) -> ErrorBody:
+    """The sender authenticated but the ACL refuses this operation."""
+    return ErrorBody(code="not_authorized", message=f"not authorized: {detail}")

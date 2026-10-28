@@ -7,13 +7,14 @@ The concept-to-code map. The canonical vocabulary is in the research doc
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│  acnl_engine (node.py)                                 │
-│  TCP server, routing table, connection threads,        │
-│  directory, service advertising, backpressure          │
+│  acnl_engine (node.py · async_node.py · datagram.py)   │
+│  TCP server (threaded and asyncio), routing table,     │
+│  connection handlers, UDP sequenced plane, backpressure │
 ├────────────────────────────────────────────────────────┤
 │  acnl_core (contract — IO-free)                        │
 │  Envelope, operations, query language, state machine,  │
-│  codec (length-prefix, MAX_FRAME), validation          │
+│  codec (length-prefix, MAX_FRAME), validation,         │
+│  security (MAC verify/open/authorize at one entrance)  │
 ├────────────────────────────────────────────────────────┤
 │  TCP wire                                              │
 │  u32 BE length + JSON body, MAX_FRAME cap              │
@@ -22,7 +23,9 @@ The concept-to-code map. The canonical vocabulary is in the research doc
 
 `acnl_core` has **no sockets**. A transport only moves bytes; the
 contract is the only place that validates. This is what makes every
-binding and every test cheap.
+binding and every test cheap. The security policy is IO-free too: the
+transports *call* it — verify on read, protect on write — and both node
+implementations call it in the same places.
 
 ## Message layer vs. operation layer
 
@@ -70,10 +73,21 @@ Two layers, never fused:
 
 - **Transport adapters**: `acnl_core.contract` is IO-free, so a
   transport (TCP, SSE, Unix socket) only moves bytes. New transports
-  plug in without touching the contract.
-- **Directory backends**: `acnl_engine.directory` is a small
-  `Protocol`-shaped interface; an in-memory adapter ships today, a
-  durable backend is a gap list item.
+  plug in without touching the contract. Two transports ship: the TCP
+  stream (threaded and asyncio nodes) and the UDP datagram plane
+  (`acnl_engine.datagram`) carrying the sequenced contract end-to-end.
+- **Second node implementation**: `acnl_engine.async_node` is the same
+  broker on one event loop — same wire, refusals, federation, security,
+  and persistence semantics (shared `resolve_directory`), tested against
+  the threaded client and federating with the threaded node.
+- **Security adapter**: `acnl_core.security.SecurityPolicy` is called at
+  one entrance on read (verify → open → authorize) and one on write
+  (seal → sign); `NodeConfig.security=None` keeps the wire byte-identical
+  to the pre-security protocol.
+- **Directory backends**: `acnl_engine.config.resolve_directory` is the
+  single place a node picks its directory (in-memory, file-backed via
+  `NodeConfig.data_path`, or injected); an injected directory is the
+  caller's, an opened one is closed on stop.
 - **Peers**: `acnl_engine.node` is the reference participant. Any
   framework that speaks the wire format can peer with it.
 - **Broker federation** (`Node.peer(host, port)`): broadcast federation —

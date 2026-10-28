@@ -1,12 +1,10 @@
 """The directory contract: a small interface, then implementations on top.
-
 Storage/IO boundary as a ``Protocol`` with a small method count. Every record
 is a plain dataclass that knows nothing about the storage. Adapters are
 deliberately different: ``InMemoryDirectory`` is zero-dependency and
 non-durable; ``ShelveDirectory`` is durable and file-backed. The same
 scenario must run on every adapter and assert *identical* outcomes — that
 assertion is the artifact that justifies the word agnostic.
-
 Naming = hierarchical name → reference, with an **explicit rebind**. A silent
 overwrite on bind lets a typo take over a name.
 """
@@ -14,6 +12,7 @@ overwrite on bind lets a typo take over a name.
 from __future__ import annotations
 
 import shelve
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
@@ -102,42 +101,76 @@ class DuplicateName(ValueError):
 
 class ShelveDirectory:
     """Durable, file-backed adapter. Same semantics as the in-memory one,
-    persisted to a shelve file."""
+    persisted to a shelve file.
+
+    Two hazards of the reference node's threading are handled here, not by
+    luck:
+
+    - **Thread affinity**: on Python 3.13+ the default shelve backend is
+      ``dbm.sqlite3``, and SQLite objects may only be used from the thread
+      that created them — the node's reader thread would die with
+      ``SQLite objects created in a thread can only be used in that same
+      thread``. So each thread gets *its own* handle on first use
+      (``threading.local``), and one instance-level ``RLock`` serializes
+      every read-modify-write across those handles — a shelve's
+      ``clear()`` + ``update()`` cycles are not atomic on their own.
+    - **Release on stop**: all opened handles are registered; ``close()``
+      closes every one it can (best effort across threads), so the next
+      instance can open the file. The lock is what makes the adapter safe
+      under the node's accept/reader/timer threads, not just the suite's
+      single thread."""
 
     def __init__(self, path: str):
         self._path = path
-        self._store: shelve.Shelf = shelve.open(path, flag="c", writeback=False)
+        self._lock = threading.RLock()
+        self._local = threading.local()
+        self._handles: List[shelve.Shelf] = []
+
+    def _db(self) -> shelve.Shelf:
+        handle = getattr(self._local, "handle", None)
+        if handle is None:
+            handle = shelve.open(self._path, flag="c", writeback=False)
+            self._local.handle = handle
+            with self._lock:
+                self._handles.append(handle)
+        return handle
 
     def _load(self) -> Dict[str, Any]:
-        return dict(self._store)
+        return dict(self._db())
+
+    def _flush(self, data: Dict[str, Any]) -> None:
+        db = self._db()
+        db.clear()
+        db.update(data)
 
     def bind(self, urn: str, reference: Reference, overwrite: bool = False) -> None:
-        data = self._load()
-        if urn in data and not overwrite:
-            raise DuplicateName(urn)
-        e = data[urn] if urn in data else Entry(urn=urn, reference=reference)
-        e.reference = reference
-        e.expires_at = None
-        data[urn] = e
-        self._store.clear()
-        self._store.update(data)
+        with self._lock:
+            data = self._load()
+            if urn in data and not overwrite:
+                raise DuplicateName(urn)
+            e = data[urn] if urn in data else Entry(urn=urn, reference=reference)
+            e.reference = reference
+            e.expires_at = None
+            data[urn] = e
+            self._flush(data)
 
     def advertise(self, urn: str, reference: Reference, ttl: float) -> None:
         if ttl <= 0:
             raise ValueError(f"ttl must be positive, got {ttl}")
-        data = self._load()
-        data[urn] = Entry(urn=urn, reference=reference, expires_at=time.time() + ttl)
-        self._store.clear()
-        self._store.update(data)
+        with self._lock:
+            data = self._load()
+            data[urn] = Entry(urn=urn, reference=reference, expires_at=time.time() + ttl)
+            self._flush(data)
 
     def unbind(self, urn: str) -> None:
-        data = self._load()
-        data.pop(urn, None)
-        self._store.clear()
-        self._store.update(data)
+        with self._lock:
+            data = self._load()
+            data.pop(urn, None)
+            self._flush(data)
 
     def resolve(self, urn: str) -> Optional[Reference]:
-        e = self._load().get(urn)
+        with self._lock:
+            e = self._load().get(urn)
         if e is None:
             return None
         if e.expires_at is not None and e.expires_at <= time.time():
@@ -145,25 +178,40 @@ class ShelveDirectory:
         return e.reference
 
     def query(self, ast: Any) -> List[Reference]:
-        return [e.reference for e in self._load().values() if _eval(ast, e.reference.to_dict())]
+        with self._lock:
+            data = self._load()
+        return [e.reference for e in data.values() if _eval(ast, e.reference.to_dict())]
 
     def sweep(self, now: Optional[float] = None) -> List[str]:
         now = now if now is not None else time.time()
-        data = self._load()
-        evicted = [u for u, e in data.items() if e.expires_at is not None and e.expires_at <= now]
-        for u in evicted:
-            del data[u]
-        if evicted:
-            self._store.clear()
-            self._store.update(data)
+        with self._lock:
+            data = self._load()
+            evicted = [u for u, e in data.items() if e.expires_at is not None and e.expires_at <= now]
+            for u in evicted:
+                del data[u]
+            if evicted:
+                self._flush(data)
         return evicted
 
     def count(self) -> int:
-        return len(self._load())
+        with self._lock:
+            return len(self._load())
 
     def snapshot(self) -> List[Reference]:
         now = time.time()
-        return [e.reference for e in self._load().values() if e.expires_at is None or e.expires_at > now]
+        with self._lock:
+            data = self._load()
+        return [e.reference for e in data.values() if e.expires_at is None or e.expires_at > now]
 
     def close(self) -> None:
-        self._store.close()
+        with self._lock:
+            for handle in list(self._handles):
+                try:
+                    handle.close()
+                except Exception:
+                    # closing another thread's SQLite handle is refused by
+                    # the affinity check; its connection is released when
+                    # the owning thread's locals are collected
+                    pass
+            self._handles.clear()
+            self._local = threading.local()

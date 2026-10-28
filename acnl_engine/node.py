@@ -35,10 +35,12 @@ from acnl_core.codec import CodecError, FrameDecoder, encode_frame
 from acnl_core.directory import Directory, DuplicateName, InMemoryDirectory
 from acnl_core.errors import (
     ErrorBody,
+    authentication_failed,
     duplicate_name,
     hops_exhausted,
     loop_detected,
     malformed,
+    not_authorized,
     queue_full,
     target_unreachable,
     unavailable,
@@ -48,6 +50,7 @@ from acnl_core.errors import (
 from acnl_core.messages import (
     MAX_TTL,
     OPERATIONS,
+    REQUEST_ID_RE,
     WIRE_KINDS,
     Envelope,
     MessageError,
@@ -56,11 +59,12 @@ from acnl_core.messages import (
     new_id,
 )
 from acnl_core.sequencing import ConnectionTracker, ConnectionState
+from acnl_core.security import AuthorizationError, SecurityError
 
 from .config import NodeConfig
 
 
-def _err(conn: "Connection", to: str, body: ErrorBody, request_id: str = None) -> None:
+def _err(conn, to: str, body: ErrorBody, request_id: Optional[str] = None) -> None:
     conn.push(
         WireMessage(
             kind="error",
@@ -116,7 +120,11 @@ class Node:
 
     def __init__(self, config: NodeConfig, directory: Optional[Directory] = None):
         self.cfg = config
-        self.directory = directory or InMemoryDirectory()
+        self.sec = config.security
+        from .config import resolve_directory
+
+        # shared with AsyncNode so persistence semantics cannot drift
+        self.directory, self._owns_directory = resolve_directory(config, directory)
         self.conns: Dict[str, Connection] = {}
         self.remote_agents: Dict[str, str] = {}  # urn -> conn_id that advertised it
         self.remote_directory: Dict[str, Tuple[Dict[str, Any], str]] = {}  # urn -> (reference, conn_id)
@@ -165,6 +173,12 @@ class Node:
             try:
                 self._listener.close()
             except OSError:
+                pass
+        closer = getattr(self.directory, "close", None)
+        if self._owns_directory and closer is not None:
+            try:
+                closer()
+            except Exception:
                 pass
 
     def _shutdown(self, conn: Connection) -> None:
@@ -241,7 +255,11 @@ class Node:
                 time.sleep(0.02)
                 continue
             try:
-                conn.sock.sendall(encode_frame(msg.to_value()))
+                value = msg.to_value()
+                if self.sec is not None:
+                    # every hop protects afresh: route/ttl mutated on forward
+                    value = self.sec.protect(value)
+                conn.sock.sendall(encode_frame(value))
             except (OSError, ValueError):
                 conn.dead = True
                 break
@@ -264,6 +282,14 @@ class Node:
                 self._send_error(conn, malformed(str(e)))
                 continue
             for value, _ in frames:
+                if self.sec is not None:
+                    try:
+                        value = self.sec.verify(value)
+                    except SecurityError as e:
+                        # fail closed, in-protocol: the connection stays open
+                        # and the refusal is a typed user error
+                        self._refuse(conn, value, authentication_failed(str(e)))
+                        continue
                 self._handle_frame(conn, value)
         conn.dead = True
         evicted: List[str] = []
@@ -285,11 +311,34 @@ class Node:
     # ------------------------------------------------------------------
     # frame handling
 
+    def _refuse(self, conn: "Connection", value: Any, body: ErrorBody) -> None:
+        """Refuse a frame that failed before parsing: echo the sender's
+        request_id when it is well-formed, so a waiting caller can match the
+        refusal; fall back to a fresh id for hostile garbage."""
+        rid = None
+        if isinstance(value, dict):
+            env = value.get("envelope")
+            if isinstance(env, dict) and isinstance(env.get("request_id"), str) and REQUEST_ID_RE.match(
+                env["request_id"]
+            ):
+                rid = env["request_id"]
+        _err(conn, conn.sender or "acnl:unknown/unknown/unknown", body, request_id=rid)
+
     def _handle_frame(self, conn: Connection, value: Any) -> None:
+        if self.sec is not None:
+            # idempotent: opens a sealed body (also for values reassembled
+            # from fragments, whose transport frames authenticated each piece)
+            try:
+                value = self.sec.open_value(value, require=self.sec.require_encryption)
+            except SecurityError as e:
+                self._refuse(conn, value, authentication_failed(str(e)))
+                return
         try:
             msg = WireMessage.from_value(value)
         except MessageError as e:
-            self._send_error(conn, self._classify_message_error(e))
+            # echo the caller's request_id when the envelope is parseable:
+            # a waiting caller must be able to match its own refusal
+            self._refuse(conn, value, self._classify_message_error(e))
             return
         if msg.kind == "hello":
             self._handle_hello(conn, msg)
@@ -411,6 +460,14 @@ class Node:
         if op not in OPERATIONS:
             _err(conn, msg.envelope.sender, unknown_verb(op, list(OPERATIONS)), msg.envelope.request_id)
             return
+        # authorization: default-deny when an ACL is configured, checked at
+        # the routing entrance on every hop (forwarded requests included)
+        if self.sec is not None and self.sec.acl is not None:
+            try:
+                self.sec.authorize(msg.envelope.sender, op, msg.envelope.recipient)
+            except AuthorizationError as e:
+                _err(conn, msg.envelope.sender, not_authorized(str(e)), msg.envelope.request_id)
+                return
         # route by the envelope's recipient
         recipient = msg.envelope.recipient
         if recipient == self.cfg.self_urn:

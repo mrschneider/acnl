@@ -106,3 +106,39 @@ communication layer. The requirements are stated as *what must hold*, not
 - **R10.9** An explicit withdraw of the agent's own name wins over its
   implicit registration; a withdraw of a name carried by a peer link must
   not desync the federation.
+
+## R11 — Security
+
+- **R11.1** When a policy is configured, every outgoing frame carries a
+  per-hop MAC computed *after* the hop's envelope mutations, and the reader
+  verifies before parsing anything.
+- **R11.2** An authentication or decryption failure is a typed refusal
+  answered in-protocol; the connection stays open and the refusal echoes
+  the caller's request_id when it is well-formed.
+- **R11.3** Encryption covers the body only: routing headers (and a
+  request's `op`) stay visible to brokers; the ciphertext is bound to
+  `kind` + origin `sender` so it cannot be spliced across messages.
+- **R11.4** Authorization is default-deny whenever an ACL exists; a
+  matching rule is required for (sender, op, recipient) on every hop.
+- **R11.5** Without a configured policy the wire is byte-identical to the
+  pre-security protocol (opt-in, additive keys).
+
+## R12 — Datagram plane
+
+- **R12.1** The sequenced contract runs end-to-end over UDP: send window
+  retransmits unacked sequences, receive window orders, holds gaps, and
+  refuses duplicates; a refused duplicate is recorded and never
+  double-delivered.
+- **R12.2** Oversized payloads and datagrams are refused before the wire;
+  hostile bytes are recorded without killing the link.
+- **R12.3** The connection state machine is the contract's, on both
+  endpoints, including close.
+
+## R13 — Async implementation
+
+- **R13.1** The asyncio node speaks the identical wire and produces the
+  identical refusals as the threaded node for the same scenario.
+- **R13.2** Backpressure stays bounded: one queue per connection, a full
+  queue maps to a retryable `queue_full`, the loop never blocks on write.
+- **R13.3** The two implementations federate with each other without
+  special cases.
