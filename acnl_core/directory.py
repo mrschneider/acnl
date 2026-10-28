@@ -106,42 +106,40 @@ class ShelveDirectory:
     Two hazards of the reference node's threading are handled here, not by
     luck:
 
-    - **Thread affinity**: on Python 3.13+ the default shelve backend is
-      ``dbm.sqlite3``, and SQLite objects may only be used from the thread
-      that created them — the node's reader thread would die with
-      ``SQLite objects created in a thread can only be used in that same
-      thread``. So each thread gets *its own* handle on first use
-      (``threading.local``), and one instance-level ``RLock`` serializes
-      every read-modify-write across those handles — a shelve's
-      ``clear()`` + ``update()`` cycles are not atomic on their own.
-    - **Release on stop**: all opened handles are registered; ``close()``
-      closes every one it can (best effort across threads), so the next
-      instance can open the file. The lock is what makes the adapter safe
-      under the node's accept/reader/timer threads, not just the suite's
-      single thread."""
+    - **One handle, one lock**: every thread shares a single shelf
+      serialized by an instance ``RLock`` — a shelve's ``clear()`` +
+      ``update()`` cycles are not atomic on their own. The backend is
+      chosen explicitly: ``dbm.gnu`` (or ``dbm.dumb`` as fallback),
+      because 3.13+'s *default* ``dbm.sqlite3`` is thread-affine (a
+      cross-thread use dies with ``SQLite objects created in a thread can
+      only be used in that same thread``) and gdbm's per-*fd* file lock
+      rejects a second same-process opener (``Errno 11``). Neither chosen
+      backend has either restriction.
+    - **Release on stop**: ``close()`` releases the handle, so the next
+      instance can open the file."""
 
     def __init__(self, path: str):
         self._path = path
         self._lock = threading.RLock()
-        self._local = threading.local()
-        self._handles: List[shelve.Shelf] = []
+        self._store: shelve.Shelf = self._open(path)
 
-    def _db(self) -> shelve.Shelf:
-        handle = getattr(self._local, "handle", None)
-        if handle is None:
-            handle = shelve.open(self._path, flag="c", writeback=False)
-            self._local.handle = handle
-            with self._lock:
-                self._handles.append(handle)
-        return handle
+    @staticmethod
+    def _open(path: str) -> shelve.Shelf:
+        try:
+            import dbm.gnu
+
+            return shelve.Shelf(dbm.gnu.open(path, "c"))  # type: ignore[arg-type]
+        except ImportError:
+            import dbm.dumb
+
+            return shelve.Shelf(dbm.dumb.open(path, "c"))  # type: ignore[arg-type]
 
     def _load(self) -> Dict[str, Any]:
-        return dict(self._db())
+        return dict(self._store)
 
     def _flush(self, data: Dict[str, Any]) -> None:
-        db = self._db()
-        db.clear()
-        db.update(data)
+        self._store.clear()
+        self._store.update(data)
 
     def bind(self, urn: str, reference: Reference, overwrite: bool = False) -> None:
         with self._lock:
@@ -205,13 +203,4 @@ class ShelveDirectory:
 
     def close(self) -> None:
         with self._lock:
-            for handle in list(self._handles):
-                try:
-                    handle.close()
-                except Exception:
-                    # closing another thread's SQLite handle is refused by
-                    # the affinity check; its connection is released when
-                    # the owning thread's locals are collected
-                    pass
-            self._handles.clear()
-            self._local = threading.local()
+            self._store.close()

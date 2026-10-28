@@ -44,6 +44,9 @@ def _pair(**kw):
     b = UdpLink(local=(host, port_b), peer=(host, port_a), **kw)
     a.open()
     b.open()
+    # a's first hello raced b's bind (nothing was listening yet): re-send it
+    # so BOTH endpoints complete the handshake deterministically
+    a._send_raw({"t": "hello"})
     return a, b
 
 
@@ -69,9 +72,11 @@ def _close(*links):
 def test_in_order_delivery_and_acks():
     a, b = _pair()
     try:
-        # the hello handshake completed during _pair: both machines moved
-        # OPEN -> ESTABLISHED on first contact
-        assert a.state is ConnectionState.ESTABLISHED
+        # the hello handshake races the assertion on a loaded runner:
+        # wait for BOTH endpoints to see their hello before asserting
+        assert _wait(lambda: a.state is ConnectionState.ESTABLISHED
+                     and b.state is ConnectionState.ESTABLISHED), \
+            "hello handshake must establish both sides"
         for i in range(5):
             a.send({"n": i})
         assert _wait(lambda: len(b.delivered) == 5), "all five payloads must arrive"

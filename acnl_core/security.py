@@ -174,6 +174,18 @@ class SecurityPolicy:
     require_encryption: bool = False
     acl: Optional[List[Dict[str, Any]]] = None
 
+    def __post_init__(self) -> None:
+        if self.encrypt or self.require_encryption:
+            # fail at construction, never mid-flight in a writer thread
+            # (a missing package there looks like a silent peer)
+            try:
+                import cryptography.hazmat.primitives.ciphers.aead  # noqa: F401
+            except ImportError as e:
+                raise SecurityError(
+                    "encrypt/require_encryption needs the optional 'cryptography' "
+                    "package: pip install acnl[security]"
+                ) from e
+
     @classmethod
     def from_secret(
         cls,

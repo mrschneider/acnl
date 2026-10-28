@@ -88,6 +88,7 @@ def test_signed_encrypted_end_to_end():
 
 
 def test_unsigned_frame_refused_with_auth_failed_code():
+    pytest.importorskip("cryptography")
     pol = SecurityPolicy.from_secret(PSK, encrypt=True)
     node = _node(pol)
     try:
@@ -119,6 +120,7 @@ def test_unsigned_frame_refused_with_auth_failed_code():
 
 
 def test_tampered_signed_frame_refused():
+    pytest.importorskip("cryptography")
     pol = SecurityPolicy.from_secret(PSK, encrypt=True)
     node = _node(pol)
     try:
@@ -209,6 +211,7 @@ def test_pre_security_node_ignores_auth_block():
 
 
 def test_federation_with_policy_end_to_end():
+    pytest.importorskip("cryptography")
     pol = SecurityPolicy.from_secret(PSK, encrypt=True)
     n1 = _node(pol, name="node1")
     n2 = _node(SecurityPolicy.from_secret(PSK, encrypt=True), name="node2")

@@ -200,7 +200,7 @@ class AsyncNode:
                     value = self.sec.protect(value)
                 conn.writer.write(encode_frame(value))
                 await conn.writer.drain()
-        except (ConnectionError, OSError, asyncio.CancelledError):
+        except (ConnectionError, OSError, SecurityError, asyncio.CancelledError):
             pass
         finally:
             conn.dead = True

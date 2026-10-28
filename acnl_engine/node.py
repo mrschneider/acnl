@@ -260,7 +260,9 @@ class Node:
                     # every hop protects afresh: route/ttl mutated on forward
                     value = self.sec.protect(value)
                 conn.sock.sendall(encode_frame(value))
-            except (OSError, ValueError):
+            except (OSError, ValueError, SecurityError):
+                # a seal failure is a config error: kill the connection
+                # cleanly instead of crashing the writer thread
                 conn.dead = True
                 break
         conn.dead = True
