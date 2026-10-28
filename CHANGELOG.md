@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows
 the protocol's own policy (R8): a different major is refused on the wire, a
 different minor is accepted as additive.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-27
 
 ### Added
 

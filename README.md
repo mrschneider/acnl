@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**Status:** v0.2.0 · **Language:** Python 3.10+ (core is stdlib-only; encryption is an optional `[security]` extra) · **Interop driver:** Node.js
+**Status:** v0.3.0 · **Language:** Python 3.10+ (core is stdlib-only; encryption is an optional `[security]` extra) · **Interop driver:** Node.js
 
 ## What it is
 
