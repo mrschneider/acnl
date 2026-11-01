@@ -5,6 +5,34 @@ All notable changes to this project are documented here. The format follows
 the protocol's own policy (R8): a different major is refused on the wire, a
 different minor is accepted as additive.
 
+## [0.4.0] — 2026-11-01
+
+### Performance
+
+- **Engine: polling replaced with condition wake-ups** — the client and
+  node reply paths polled on 20ms sleeps (`time.sleep(0.02)`), putting a
+  hard floor under every operation. Client ping p50 **20.46ms -> 0.15ms
+  (~136x)**; sequential throughput **47.6 -> ~5900 ops/s (~120x)**; 128
+  concurrent threaded clients p50 **63.9ms -> 5.8ms (~11x)**. Reader
+  shutdown now joins the reader thread instead of sleep-polling.
+- **Directory: inverted index for the query language** — `attr -> value
+  -> {urns}` buckets with per-conjunct candidate sets: a selective
+  top-level `=` conjunct evaluates only its bucket, `AND` intersects,
+  lists index as frozensets. 50k-attribute query `'shard = 7'` runs in
+  **~1.9ms** (1,563 hits); the old full scan did not finish the same
+  benchmark stage in 90s.
+- **ShelveDirectory: in-memory + batched flush** — the shelf loads once
+  at open, reads are pure memory, and dirty entries flush when the count
+  reaches `flush_every` or a background timer wakes (`flush_interval`),
+  always on `close()`/`stop()`. 2,000 advertises in 87ms (**43.7us/op**),
+  resolve at 2k entries still ~0ms.
+- `experiments/bench_perf.py` — the benchmark driver for the numbers
+  above (client latency, thread/async concurrency, directory, query,
+  dedupe window).
+
+Gates: 118 tests OK, Node.js e2e 11/11 (wire byte-identical, security
+entrance order unchanged).
+
 ## [0.3.0] — 2026-10-27
 
 ### Added

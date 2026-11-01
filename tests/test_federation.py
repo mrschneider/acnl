@@ -104,7 +104,18 @@ def test_federated_query_merges_and_dedupes(two_peered):
         c1.bind("acnl:lab/shared/svc", _ref("acnl:lab/shared/svc", attributes={"side": "local"}))
         c2.advertise("acnl:lab/shared/svc", _ref("acnl:lab/shared/svc", attributes={"side": "remote"}))
         c2.advertise("acnl:lab/node2/math", _ref("acnl:lab/node2/math", capabilities=["math"]))
-        assert _wait(lambda: "acnl:lab/node2/math" in n1.remote_directory)
+        # wait for the ADVERTISE entries to land on n1, not just any entry:
+        # the implicit registration (no capabilities) arrives first, and a
+        # query against the placeholder would race the advertise notification
+        assert _wait(
+            lambda: (n1.remote_directory.get("acnl:lab/node2/math", (None,))[0] or {}).get("capabilities") == ["math"]
+        )
+        assert _wait(
+            lambda: (n1.remote_directory.get("acnl:lab/shared/svc", (None,))[0] or {})
+            .get("attributes")
+            .get("side")
+            == "remote"
+        )
         hits = c1.query('name CONTAINS "svc" OR capabilities CONTAINS "math"')
         urns = [h["urn"] for h in hits]
         assert urns.count("acnl:lab/shared/svc") == 1
@@ -127,6 +138,17 @@ def test_cross_broker_send_roundtrip(two_peered):
         c1.connect("127.0.0.1", n1._listener.getsockname()[1])
         c2.connect("127.0.0.1", n2._listener.getsockname()[1])
         c2.set_handler(lambda msg: {"op": "send", "echo": msg.body.get("payload")})
+        # wait for BOTH directions of the implicit registration:
+        #  - n1.remote_agents: the forward route (the router reads exactly
+        #    this dict to hop the request to n2) — the notify broadcasted by
+        #    n2 when c2 registered
+        #  - n2.remote_agents: the reply route (n2 must know where c1 lives
+        #    to send the answer back two hops)
+        # guarding only the reply side (as before) raced the forward sync:
+        # under load the request hit n1 before c2's notify arrived
+        assert _wait(lambda: "acnl:lab/node2/math" in n1.remote_agents), (
+            "c2's registration must reach n1 so the request has a forward route"
+        )
         assert _wait(lambda: c1.agent_urn in n2.remote_agents), (
             "implicit registration must propagate so the peer can route the reply back"
         )

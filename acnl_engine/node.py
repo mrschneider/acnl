@@ -98,17 +98,24 @@ class Connection:
     is_peer: bool = False  # broker-to-broker link (federation)
     dead: bool = False
     closed_reason: str = None
+    wake: threading.Condition = None
 
     def __post_init__(self):
         if self.tracker is None:
             self.tracker = ConnectionTracker()
+        # the writer sleeps on this condition; a push is a wake-up, not a
+        # busy-poll (the old loop slept 20ms per empty check)
+        if self.wake is None:
+            self.wake = threading.Condition()
 
     def try_send(self, msg: WireMessage) -> bool:
         if self.dead:
             return False
-        if len(self.queue) >= self.queue_depth:
-            return False
-        self.queue.append(msg)
+        with self.wake:
+            if len(self.queue) >= self.queue_depth:
+                return False
+            self.queue.append(msg)
+            self.wake.notify()
         return True
 
     def push(self, msg: WireMessage) -> bool:
@@ -126,10 +133,16 @@ class Node:
         # shared with AsyncNode so persistence semantics cannot drift
         self.directory, self._owns_directory = resolve_directory(config, directory)
         self.conns: Dict[str, Connection] = {}
+        # sender -> conn, kept in sync with conns: routing used to rebuild
+        # this dict (two full scans under the lock) on every request/reply
+        self._senders: Dict[str, Connection] = {}
         self.remote_agents: Dict[str, str] = {}  # urn -> conn_id that advertised it
         self.remote_directory: Dict[str, Tuple[Dict[str, Any], str]] = {}  # urn -> (reference, conn_id)
         self._seen: deque = deque(maxlen=1024)  # dedupe window
         self._seen_set: set = set()
+        # its own lock: the dedupe check is the hottest path and must not
+        # queue behind the global lock (which guards routing + conns)
+        self._dedupe_lock = threading.Lock()
         self._lock = threading.RLock()
         self._fragments: Dict[Tuple[str, str], Dict[int, bytes]] = {}
         self._fragments_meta: Dict[Tuple[str, str], Tuple[int, float]] = {}
@@ -187,11 +200,16 @@ class Node:
         except OSError:
             pass
         conn.dead = True
+        with conn.wake:
+            conn.wake.notify_all()
 
     def peer(self, host: str, port: int, timeout: float = 5.0) -> None:
         """Link to another broker as a federation peer. Registration is
         implicit: the link is a hello with role=broker, and the answering
         side pushes its whole directory table as notify frames."""
+        with self._lock:
+            if sum(1 for c in self.conns.values() if not c.dead) >= self.cfg.max_peers:
+                raise RuntimeError(f"max_peers ({self.cfg.max_peers}) reached")
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.settimeout(0.5)
         cid = new_id()
@@ -228,6 +246,15 @@ class Node:
                 continue
             except OSError:
                 break
+            # max_peers is enforced here (it was configured but never applied):
+            # a limit that is only in the config is not a limit
+            with self._lock:
+                if sum(1 for c in self.conns.values() if not c.dead) >= self.cfg.max_peers:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    continue
             sock.settimeout(0.5)
             cid = new_id()
             conn = Connection(
@@ -249,17 +276,25 @@ class Node:
 
     def _writer_loop(self, conn: Connection) -> None:
         while not conn.dead:
+            with conn.wake:
+                while not conn.queue and not conn.dead and not self._stop:
+                    conn.wake.wait()
+                if conn.dead or self._stop:
+                    break
+                # coalesce: everything queued at this instant goes out in
+                # one sendall (a peer snapshot burst is N frames, not N
+                # syscalls); the next wake starts a new batch
+                batch = list(conn.queue)
+                conn.queue.clear()
             try:
-                msg = conn.queue.popleft()
-            except IndexError:
-                time.sleep(0.02)
-                continue
-            try:
-                value = msg.to_value()
-                if self.sec is not None:
-                    # every hop protects afresh: route/ttl mutated on forward
-                    value = self.sec.protect(value)
-                conn.sock.sendall(encode_frame(value))
+                frames = bytearray()
+                for msg in batch:
+                    value = msg.to_value()
+                    if self.sec is not None:
+                        # every hop protects afresh: route/ttl mutated on forward
+                        value = self.sec.protect(value)
+                    frames += encode_frame(value)
+                conn.sock.sendall(bytes(frames))
             except (OSError, ValueError, SecurityError):
                 # a seal failure is a config error: kill the connection
                 # cleanly instead of crashing the writer thread
@@ -297,6 +332,8 @@ class Node:
         evicted: List[str] = []
         with self._lock:
             self.conns.pop(conn.conn_id, None)
+            if conn.sender is not None and self._senders.get(conn.sender) is conn:
+                del self._senders[conn.sender]
             # drop the entries this connection carried (its own agents and
             # everything its side of the federation advertised): a router
             # going down takes its table with it and the loss is announced
@@ -397,6 +434,8 @@ class Node:
                 )
             )
         if is_new and conn.is_peer:
+            with self._lock:
+                self._senders[conn.sender] = conn
             # a router that just linked is told the whole table (the router's
             # table, broadcast federation), including this broker itself
             for ref in self.directory.snapshot():
@@ -412,21 +451,18 @@ class Node:
                         body={"event": "registered", "urn": ref.urn, "reference": ref.to_dict()},
                     )
                 )
+            # the peer's own broker urn was advertised locally at start():
+            # the placeholder this hello creates must not shadow the full
+            # reference (the snapshot notify above has not been processed yet)
+            self._adopt_local_registration(conn)
         if is_new and not conn.is_peer:
             # implicit registration propagates: a reply addressed to this
             # agent must be routable from a peer broker two hops away
             with self._lock:
                 self.remote_agents[conn.sender] = conn.conn_id
+                self._senders[conn.sender] = conn
                 self.remote_directory[conn.sender] = (
-                    {
-                        "urn": conn.sender,
-                        "endpoints": [f"{body.get('host', 'unknown')}:{body.get('port', 0)}"]
-                        if body.get("port")
-                        else [],
-                        "protocol_version": acnl_core.PROTOCOL_VERSION,
-                        "capabilities": list(conn.capabilities or []),
-                        "attributes": {},
-                    },
+                    self._implicit_entry(conn, body),
                     conn.conn_id,
                 )
             from acnl_core.addresses import Reference
@@ -448,10 +484,15 @@ class Node:
             return
         # dedupe: (sender, message_id) — a retried refusal replays as a refusal
         key = (msg.envelope.sender, msg.envelope.message_id)
-        with self._lock:
+        with self._dedupe_lock:
             if key in self._seen_set:
                 return
             self._seen_set.add(key)
+            # the deque evicts its leftmost on overflow: drop exactly that
+            # key, or the set grows without bound (window is 1024, the set
+            # used to keep every key ever seen)
+            if len(self._seen) == self._seen.maxlen:
+                self._seen_set.discard(self._seen[0])
             self._seen.append(key)
         # TTL: decrement per hop; refuse when exhausted
         ttl = msg.envelope.ttl
@@ -474,13 +515,11 @@ class Node:
         recipient = msg.envelope.recipient
         if recipient == self.cfg.self_urn:
             self._handle_local(conn, msg)
-        elif recipient in self.conns_by_sender():
+        elif (target := self.conn_by_sender(recipient)) is not None:
             # the recipient is a directly connected peer: forward as-is
-            target = self.conns_by_sender()[recipient]
             self._forward(conn, msg, target)
-        elif recipient in self.remote_agents:
+        elif (cid := self.remote_agents.get(recipient)) is not None:
             # a remote agent reached via the broker peer that advertised it
-            cid = self.remote_agents[recipient]
             target = self.conns.get(cid)
             if target is None or target.dead:
                 _err(conn, msg.envelope.sender, target_unreachable(recipient), msg.envelope.request_id)
@@ -516,9 +555,16 @@ class Node:
         ttl = float(body.get("ttl", self.cfg.directory_ttl))
         ref = self._reference_from_body(body)
         self.directory.advertise(ref.urn, ref, ttl)
-        # register the remote agent as reachable via this connection
+        # register the remote agent as reachable via this connection.
+        # A local agent advertising through its own connection must keep its
+        # own conn as the route — and the entry must reflect the advertised
+        # reference, not the hello placeholder (race: hello lands after the
+        # advertise, and a placeholder with no capabilities poisons queries)
         with self._lock:
-            self.remote_agents[ref.urn] = conn.conn_id
+            if self.remote_agents.get(ref.urn) == conn.conn_id:
+                self.remote_directory[ref.urn] = (ref.to_dict(), conn.conn_id)
+            else:
+                self.remote_agents[ref.urn] = conn.conn_id
         self._reply(conn, msg, body={"op": "advertise", "urn": ref.urn, "ttl": ttl})
         self._broadcast_to_peers(conn, "registered", ref.urn, ref)
 
@@ -612,7 +658,7 @@ class Node:
         # connected recipient goes straight; otherwise the federated table
         # says which peer link carries the recipient's side of the network.
         recipient = msg.envelope.recipient
-        target = self.conns_by_sender().get(recipient)
+        target = self.conn_by_sender(recipient)
         if target is None:
             with self._lock:
                 cid = self.remote_agents.get(recipient)
@@ -645,6 +691,40 @@ class Node:
                 self.remote_agents.pop(urn, None)
                 self.remote_directory.pop(urn, None)
         self._broadcast_to_peers(conn, event, urn, msg.body.get("reference"))
+
+    def _implicit_entry(self, conn: Connection, body: Dict[str, Any]) -> Dict[str, Any]:
+        """The reference a fresh hello records in the federated table.
+
+        If the sender already advertised on this node, the advertised
+        reference is authoritative: a hello placeholder (no capabilities)
+        clobbering it poisons federated queries until the next broadcast —
+        exactly the hello/advertise race the federation must not expose."""
+        local = self.directory.resolve(conn.sender)
+        if local is not None:
+            return local.to_dict()
+        return {
+            "urn": conn.sender,
+            "endpoints": [f"{body.get('host', 'unknown')}:{body.get('port', 0)}"]
+            if body.get("port")
+            else [],
+            "protocol_version": acnl_core.PROTOCOL_VERSION,
+            "capabilities": list(conn.capabilities or []),
+            "attributes": {},
+        }
+
+    def _adopt_local_registration(self, conn: Connection) -> None:
+        """The advertise raced ahead of the hello: the entry the hello
+        creates is a placeholder — swap it for the advertised reference,
+        keeping the route on the agent's own connection."""
+        ref = self.directory.resolve(conn.sender)
+        if ref is None:
+            return
+        with self._lock:
+            entry = self.remote_directory.get(conn.sender)
+            if entry is None or entry[1] != conn.conn_id:
+                return
+            self.remote_directory[conn.sender] = (ref.to_dict(), conn.conn_id)
+        self._broadcast_to_peers(conn, "registered", conn.sender, ref)
 
     def _handle_fragment(self, conn: Connection, msg: WireMessage) -> None:
         body = msg.body
@@ -684,8 +764,15 @@ class Node:
     # routing helpers
 
     def conns_by_sender(self) -> Dict[str, Connection]:
+        # a maintained index (sender learned at hello, dropped at
+        # disconnect) — the old version scanned every connection twice,
+        # under the global lock, on every request and reply
         with self._lock:
-            return {c.sender: c for c in self.conns.values() if c.sender}
+            return dict(self._senders)
+
+    def conn_by_sender(self, sender: str) -> Optional[Connection]:
+        with self._lock:
+            return self._senders.get(sender)
 
     def _forward(self, conn: Connection, msg: WireMessage, target: Connection) -> None:
         # each hop appends its own id to the route
@@ -755,18 +842,28 @@ class Node:
 
     def _re_advertise(self) -> None:
         ref = self.directory.resolve(self.cfg.self_urn)
-        if ref is None:
-            return
-        self.directory.advertise(self.cfg.self_urn, ref, self.cfg.directory_ttl)
-        self._broadcast_to_peers(None, "registered", self.cfg.self_urn, ref)
+        if ref is not None:
+            self.directory.advertise(self.cfg.self_urn, ref, self.cfg.directory_ttl)
+            self._broadcast_to_peers(None, "registered", self.cfg.self_urn, ref)
         # federation: re-broadcast the learned table so entries propagate
         # hop by hop (a router that linked after the original announcement
         # still converges), excluding the peer that taught us the entry —
-        # sending it back is an echo, not propagation
+        # sending it back is an echo, not propagation. A reference that is
+        # also local (our own agents advertise through us) is re-sent from
+        # the local table, where it is authoritative: the federated copy is
+        # a hello placeholder until the local advertise lands, and
+        # rebroadcasting it would re-pollute the peers
         with self._lock:
             learned = [(urn, d, cid) for urn, (d, cid) in self.remote_directory.items()]
         for urn, d, cid in learned:
             origin = self.conns.get(cid)
             if origin is None:
                 continue
-            self._broadcast_to_peers(origin, "registered", urn, d, peers_only=True)
+            local = self.directory.resolve(urn)
+            self._broadcast_to_peers(
+                origin,
+                "registered",
+                urn,
+                local.to_dict() if local is not None else d,
+                peers_only=True,
+            )

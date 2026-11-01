@@ -224,6 +224,13 @@ def test_federation_with_policy_end_to_end():
         c2.connect("127.0.0.1", n2._listener.getsockname()[1])
         try:
             c2.advertise("acnl:lab/node2/math", _ref("acnl:lab/node2/math", capabilities=["math"]))
+            # the advertise is fire-and-forget: wait for the sealed notify to
+            # cross the peer link and land in n1's federated table, or the
+            # resolve below races it (and fails with unknown_service under load)
+            assert _wait(
+                lambda: (n1.remote_directory.get("acnl:lab/node2/math", (None,))[0] or {}).get("capabilities")
+                == ["math"]
+            ), "advertise must reach n1's federated table before the resolve"
             c1 = Client("acnl:lab/node1/worker", security=SecurityPolicy.from_secret(PSK, encrypt=True))
             c1.connect("127.0.0.1", n1._listener.getsockname()[1])
             try:

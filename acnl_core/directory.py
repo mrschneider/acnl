@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
 
 from .addresses import Reference
-from .attributes import _eval
+from .attributes import And, Cmp, Not, Or, _eval
 
 
 @dataclass
@@ -41,15 +41,60 @@ class Directory(Protocol):
 
 class InMemoryDirectory:
     """Zero-dependency, non-durable adapter. TTL expiry is computed by
-    ``sweep``; ``sweep`` returns the urns that were evicted."""
+    ``sweep``; ``sweep`` returns the urns that were evicted.
+
+    ``query`` is backed by an inverted index for ``attr = value`` filters:
+    the index picks the most selective attribute and evaluates the rest of
+    the AST only on its candidates. Without an ``=`` (or when the candidate
+    set is nearly the whole table) it degrades to the old full scan, so the
+    index only helps, never hurts. The index is maintained incrementally on
+    each mutation — O(reference size) per bind/advertise/unbind, never
+    O(table).
+    """
 
     def __init__(self):
         self._entries: Dict[str, Entry] = {}
+        self._index: Dict[str, Dict[Any, set]] = {}  # attr -> value -> {urns}
+        self._contrib: Dict[str, List[Tuple[str, Any]]] = {}  # urn -> (attr, key) it feeds
+
+    @staticmethod
+    def _index_key(value: Any) -> Any:
+        # lists are unordered for equality: index them as frozensets
+        return frozenset(value) if isinstance(value, (list, tuple)) else value
+
+    def _remove_from_index(self, urn: str) -> None:
+        for attr, key in self._contrib.pop(urn, []):
+            buckets = self._index.get(attr)
+            if buckets is None:
+                continue
+            bucket = buckets.pop(key, None)
+            if bucket is not None:
+                bucket.discard(urn)
+
+    def _add_to_index(self, urn: str, reference: Reference) -> None:
+        doc = reference.to_dict()
+        contrib: List[Tuple[str, Any]] = []
+        for k, v in doc.items():
+            if k == "urn" or isinstance(v, (dict, list, tuple, set)):
+                continue
+            key = self._index_key(v)
+            contrib.append((k, key))
+            self._index.setdefault(k, {}).setdefault(key, set()).add(urn)
+        for k, v in doc.get("attributes", {}).items():
+            if isinstance(v, (dict, list, tuple, set)):
+                continue
+            key = self._index_key(v)
+            contrib.append((k, key))
+            self._index.setdefault(k, {}).setdefault(key, set()).add(urn)
+        self._contrib[urn] = contrib
 
     def _bind(self, urn: str, reference: Reference, overwrite: bool, expires_at: Optional[float]) -> None:
         if urn in self._entries and not overwrite:
             raise DuplicateName(urn)
+        if urn in self._entries:
+            self._remove_from_index(urn)
         self._entries[urn] = Entry(urn=urn, reference=reference, expires_at=expires_at)
+        self._add_to_index(urn, reference)
 
     def bind(self, urn: str, reference: Reference, overwrite: bool = False) -> None:
         self._bind(urn, reference, overwrite, None)
@@ -60,7 +105,8 @@ class InMemoryDirectory:
         self._bind(urn, reference, True, time.time() + ttl)
 
     def unbind(self, urn: str) -> None:
-        self._entries.pop(urn, None)
+        if self._entries.pop(urn, None) is not None:
+            self._remove_from_index(urn)
 
     def resolve(self, urn: str) -> Optional[Reference]:
         e = self._entries.get(urn)
@@ -71,13 +117,67 @@ class InMemoryDirectory:
         return e.reference
 
     def query(self, ast: Any) -> List[Reference]:
-        return [e.reference for e in self._entries.values() if _eval(ast, e.reference.to_dict())]
+        cands = self._candidates(ast)
+        if cands is None:
+            return [e.reference for e in self._entries.values() if _eval(ast, e.reference.to_dict())]
+        return [
+            e.reference
+            for urn in cands
+            if (e := self._entries.get(urn)) is not None
+            and _eval(ast, e.reference.to_dict())
+        ]
+
+    def _candidates(self, ast: Any) -> Optional[frozenset]:
+        """Urn set from a selective top-level ``=`` conjunct, or None when no
+        such conjunct exists (or the whole table would be the answer).
+
+        The returned set is a guaranteed SUPERSET of the query's true answer,
+        so the final ``_eval`` filter over it is always correct — a match is
+        never dropped. Only *mandatory* conjuncts qualify: a ``=`` under an
+        ``OR`` branch or a ``NOT`` is not satisfied by every answer, so its
+        bucket is not a superset and we fall back to a full scan instead."""
+        best: Optional[frozenset] = None
+        for c in self._top_conjuncts(ast):
+            if not (isinstance(c, Cmp) and c.op == "="):
+                continue
+            if c.attr == "urn":
+                # a top-level field, not indexed: direct membership test
+                got = frozenset({c.value}) if isinstance(c.value, str) else frozenset()
+            else:
+                buckets = self._index.get(c.attr)
+                if buckets is None:
+                    # attribute absent from the index (special attrs like
+                    # name/zone/version, or never stored): cannot be used
+                    continue
+                got = buckets.get(self._index_key(c.value))
+                if got is None:
+                    got = frozenset()
+            if not got:
+                return frozenset()  # a mandatory conjunct matches nothing
+            if best is None or len(got) < len(best):
+                best = got
+        if best is None or len(best) * 3 >= len(self._entries):
+            return None  # full scan is cheaper than evaluating candidates
+        return best
+
+    @staticmethod
+    def _top_conjuncts(ast: Any) -> List[Any]:
+        """The direct conjuncts of the top-level ``AND`` (a bare atom is a
+        1-conjunct). Only these are mandatory — every satisfying entry must
+        match each one, so a bucket from one is a valid candidate superset.
+        A top-level ``OR``/``NOT`` yields no mandatory conjunct."""
+        if isinstance(ast, And):
+            return ast.parts
+        if isinstance(ast, (Or, Not)):
+            return []
+        return [ast]
 
     def sweep(self, now: Optional[float] = None) -> List[str]:
         now = now if now is not None else time.time()
         evicted = [u for u, e in self._entries.items() if e.expires_at is not None and e.expires_at <= now]
         for u in evicted:
             del self._entries[u]
+            self._remove_from_index(u)
         return evicted
 
     def count(self) -> int:
@@ -103,6 +203,14 @@ class ShelveDirectory:
     """Durable, file-backed adapter. Same semantics as the in-memory one,
     persisted to a shelve file.
 
+    Persistence is *batched*: the shelf is loaded once at open into an
+    in-memory cache that every operation reads and writes, and the file is
+    rewritten only when the dirty-entry count reaches ``flush_every`` or a
+    background task wakes every ``flush_interval`` seconds — and always on
+    ``close()``. The old design (load + full rewrite on *every* call) made a
+    5s sweep and a 10s re-advertise rewrite the whole file continuously,
+    with cost growing in N.
+
     Two hazards of the reference node's threading are handled here, not by
     luck:
 
@@ -115,13 +223,27 @@ class ShelveDirectory:
       only be used in that same thread``) and gdbm's per-*fd* file lock
       rejects a second same-process opener (``Errno 11``). Neither chosen
       backend has either restriction.
-    - **Release on stop**: ``close()`` releases the handle, so the next
-      instance can open the file."""
+    - **Release on stop**: ``close()`` flushes, releases the handle, so the
+      next instance can open the file."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, flush_every: int = 64, flush_interval: float = 2.0):
         self._path = path
         self._lock = threading.RLock()
         self._store: shelve.Shelf = self._open(path)
+        self._cache: Dict[str, Any] = dict(self._store)
+        # incremental flush: track what changed since the last file write,
+        # so a flush is O(dirty), not O(table) — clear()+update() of the
+        # whole shelf per batch made bulk loads O(N^2 / flush_every)
+        self._dirty_adds: set = set()
+        self._dirty_dels: set = set()
+        self._dirty = 0
+        self._flush_every = flush_every
+        self._flush_interval = flush_interval
+        self._closed = False
+        self._flusher = threading.Thread(
+            target=self._flush_loop, daemon=True, name=f"acnl-shelve-{path}"
+        )
+        self._flusher.start()
 
     @staticmethod
     def _open(path: str) -> shelve.Shelf:
@@ -134,41 +256,68 @@ class ShelveDirectory:
 
             return shelve.Shelf(dbm.dumb.open(path, "c"))  # type: ignore[arg-type]
 
-    def _load(self) -> Dict[str, Any]:
-        return dict(self._store)
+    def _mark_dirty(self, urn: str) -> None:
+        self._dirty += 1
+        self._dirty_adds.add(urn)
+        self._dirty_dels.discard(urn)
+        if self._dirty >= self._flush_every:
+            self._flush_locked()
 
-    def _flush(self, data: Dict[str, Any]) -> None:
-        self._store.clear()
-        self._store.update(data)
+    def _flush_locked(self) -> None:
+        """Write the pending changes to the file. Caller holds ``_lock``.
+        O(dirty): only the keys that changed since the last flush."""
+        if self._dirty <= 0:
+            return
+        for urn in self._dirty_dels:
+            try:
+                del self._store[urn]
+            except (KeyError, ValueError):
+                pass
+        for urn in self._dirty_adds:
+            e = self._cache.get(urn)
+            if e is not None:
+                self._store[urn] = e
+        self._dirty = 0
+        self._dirty_adds = set()
+        self._dirty_dels = set()
+
+    def _flush_loop(self) -> None:
+        while not self._closed:
+            time.sleep(self._flush_interval)
+            with self._lock:
+                if self._closed:
+                    return
+                self._flush_locked()
 
     def bind(self, urn: str, reference: Reference, overwrite: bool = False) -> None:
         with self._lock:
-            data = self._load()
-            if urn in data and not overwrite:
+            if urn in self._cache and not overwrite:
                 raise DuplicateName(urn)
-            e = data[urn] if urn in data else Entry(urn=urn, reference=reference)
+            e = self._cache[urn] if urn in self._cache else Entry(urn=urn, reference=reference)
             e.reference = reference
             e.expires_at = None
-            data[urn] = e
-            self._flush(data)
+            self._cache[urn] = e
+            self._mark_dirty(urn)
 
     def advertise(self, urn: str, reference: Reference, ttl: float) -> None:
         if ttl <= 0:
             raise ValueError(f"ttl must be positive, got {ttl}")
         with self._lock:
-            data = self._load()
-            data[urn] = Entry(urn=urn, reference=reference, expires_at=time.time() + ttl)
-            self._flush(data)
+            self._cache[urn] = Entry(urn=urn, reference=reference, expires_at=time.time() + ttl)
+            self._mark_dirty(urn)
 
     def unbind(self, urn: str) -> None:
         with self._lock:
-            data = self._load()
-            data.pop(urn, None)
-            self._flush(data)
+            if self._cache.pop(urn, None) is not None:
+                self._dirty += 1
+                self._dirty_dels.add(urn)
+                self._dirty_adds.discard(urn)
+                if self._dirty >= self._flush_every:
+                    self._flush_locked()
 
     def resolve(self, urn: str) -> Optional[Reference]:
         with self._lock:
-            e = self._load().get(urn)
+            e = self._cache.get(urn)
         if e is None:
             return None
         if e.expires_at is not None and e.expires_at <= time.time():
@@ -177,30 +326,49 @@ class ShelveDirectory:
 
     def query(self, ast: Any) -> List[Reference]:
         with self._lock:
-            data = self._load()
+            data = self._cache
         return [e.reference for e in data.values() if _eval(ast, e.reference.to_dict())]
 
     def sweep(self, now: Optional[float] = None) -> List[str]:
         now = now if now is not None else time.time()
         with self._lock:
-            data = self._load()
-            evicted = [u for u, e in data.items() if e.expires_at is not None and e.expires_at <= now]
+            evicted = [
+                u
+                for u, e in self._cache.items()
+                if e.expires_at is not None and e.expires_at <= now
+            ]
             for u in evicted:
-                del data[u]
-            if evicted:
-                self._flush(data)
+                del self._cache[u]
+                self._dirty_dels.add(u)
+                self._dirty_adds.discard(u)
+            self._dirty += len(evicted)
+            if self._dirty >= self._flush_every:
+                self._flush_locked()
         return evicted
 
     def count(self) -> int:
         with self._lock:
-            return len(self._load())
+            return len(self._cache)
 
     def snapshot(self) -> List[Reference]:
         now = time.time()
         with self._lock:
-            data = self._load()
+            data = self._cache
         return [e.reference for e in data.values() if e.expires_at is None or e.expires_at > now]
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._flush_locked()
             self._store.close()
+
+    def __del__(self):
+        # best effort: an instance that died without close() still flushes;
+        # at interpreter shutdown attributes may already be gone
+        try:
+            if not getattr(self, "_closed", True):
+                self.close()
+        except Exception:
+            pass

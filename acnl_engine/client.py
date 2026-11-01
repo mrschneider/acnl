@@ -79,6 +79,7 @@ class Client:
         self.sock.settimeout(0.5)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        self._event.clear()
         self._send(
             WireMessage(
                 kind="hello",
@@ -87,10 +88,14 @@ class Client:
             )
         )
         # the hello reply carries the broker's URN; wait for it before the
-        # first call, otherwise the client races its own greeting
+        # first call, otherwise the client races its own greeting. The reader
+        # sets _event on the hello, so this is a notification, not a poll
         deadline = time.time() + timeout
-        while self.broker_urn is None and time.time() < deadline:
-            time.sleep(0.02)
+        while self.broker_urn is None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self._event.wait(remaining)
         if self.broker_urn is None:
             raise RuntimeError("no hello reply: broker did not greet within timeout")
 
@@ -105,13 +110,24 @@ class Client:
     def close(self) -> None:
         self._closed = True
         if self.sock:
-            self._send(
-                WireMessage(
-                    kind="close",
-                    envelope=make_envelope(sender=self.agent_urn, recipient=self.broker_urn or "acnl:localhost/localhost/broker"),
+            try:
+                self._send(
+                    WireMessage(
+                        kind="close",
+                        envelope=make_envelope(sender=self.agent_urn, recipient=self.broker_urn or "acnl:localhost/localhost/broker"),
+                    )
                 )
-            )
-            self.sock.close()
+            except OSError:
+                pass
+            # drain before the socket goes: a reply already in flight would
+            # otherwise be dropped (the reader exits on the next loop check)
+            reader = self._reader
+            if reader is not None and reader is not threading.current_thread():
+                reader.join(timeout=1.0)
+            try:
+                self.sock.close()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------
     # operations
@@ -175,10 +191,15 @@ class Client:
 
     def _wait_reply(self, req_id: str, timeout: float) -> WireMessage:
         deadline = time.time() + timeout
-        while time.time() < deadline:
+        while True:
             if self.reply is not None and self.reply.envelope.request_id == req_id:
                 return self.reply
-            time.sleep(0.02)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            # the reader sets _event when a reply/error lands: no polling,
+            # no 20ms floor per call
+            self._event.wait(remaining)
         raise TimeoutError(f"no reply to {req_id} within {timeout}s")
 
     def _read_loop(self) -> None:
@@ -217,6 +238,7 @@ class Client:
             # the greeting carries the broker's URN; the client addresses it
             # with that URN from now on
             self.broker_urn = msg.body.get("urn")
+            self._event.set()
             return
         if msg.kind == "notify":
             self.on_notification(msg)
@@ -246,6 +268,7 @@ class Client:
             return
         if msg.kind in ("reply", "error"):
             self.reply = msg
+            self._event.set()
 
     def _reassemble(self, msg: WireMessage) -> None:
         body = msg.body

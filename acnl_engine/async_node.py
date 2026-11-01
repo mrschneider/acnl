@@ -95,6 +95,9 @@ class AsyncNode:
         self.sec = config.security
         self.directory, self._owns_directory = resolve_directory(config, directory)
         self.conns: Dict[str, AsyncConnection] = {}
+        # sender -> conn, kept in sync with conns: the old conns_by_sender()
+        # scanned every connection on every request and reply
+        self._senders: Dict[str, AsyncConnection] = {}
         self.remote_agents: Dict[str, str] = {}
         self.remote_directory: Dict[str, Tuple[Dict[str, Any], str]] = {}
         self._seen: deque = deque(maxlen=1024)
@@ -195,10 +198,22 @@ class AsyncNode:
         try:
             while not conn.dead and not self._stop:
                 msg = await conn.queue.get()
-                value = msg.to_value()
-                if self.sec is not None:
-                    value = self.sec.protect(value)
-                conn.writer.write(encode_frame(value))
+                # coalesce: drain whatever else is queued without yielding,
+                # so a burst (a peer's snapshot is N notify frames) is one
+                # write + one drain, not N of each
+                batch = [msg]
+                while True:
+                    try:
+                        batch.append(conn.queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                frames = bytearray()
+                for m in batch:
+                    value = m.to_value()
+                    if self.sec is not None:
+                        value = self.sec.protect(value)
+                    frames += encode_frame(value)
+                conn.writer.write(bytes(frames))
                 await conn.writer.drain()
         except (ConnectionError, OSError, SecurityError, asyncio.CancelledError):
             pass
@@ -236,6 +251,8 @@ class AsyncNode:
         if conn.read_task is not None and conn.read_task is not asyncio.current_task():
             conn.read_task.cancel()
         self.conns.pop(conn.conn_id, None)
+        if conn.sender is not None and self._senders.get(conn.sender) is conn:
+            del self._senders[conn.sender]
         evicted: List[str] = []
         for urn, cid in list(self.remote_agents.items()):
             if cid == conn.conn_id:
@@ -312,6 +329,7 @@ class AsyncNode:
             conn.capabilities = list(body.get("capabilities", []))
             conn.is_peer = body.get("role") == "broker"
             conn.tracker.transition(ConnectionState.ESTABLISHED)
+            self._senders[sender] = conn
             conn.push(
                 WireMessage(
                     kind="hello",
@@ -343,12 +361,21 @@ class AsyncNode:
                         body={"event": "registered", "urn": ref.urn, "reference": ref.to_dict()},
                     )
                 )
+            # the peer's own broker urn was advertised locally at start():
+            # the placeholder this hello creates must not shadow the full
+            # reference (the snapshot notify above has not been processed yet)
+            self._adopt_local_registration(conn)
         if is_new and not conn.is_peer:
             from acnl_core.addresses import Reference
 
-            self.remote_agents[sender] = conn.conn_id
-            self.remote_directory[sender] = (
-                {
+            local = self.directory.resolve(sender)
+            # a local agent that already advertised on this connection: the
+            # advertised reference is authoritative — a hello placeholder
+            # (no capabilities) would poison federated queries
+            entry = (
+                local.to_dict()
+                if local is not None
+                else {
                     "urn": sender,
                     "endpoints": [f"{body.get('host', 'unknown')}:{body.get('port', 0)}"]
                     if body.get("port")
@@ -356,15 +383,28 @@ class AsyncNode:
                     "protocol_version": acnl_core.PROTOCOL_VERSION,
                     "capabilities": list(conn.capabilities or []),
                     "attributes": {},
-                },
-                conn.conn_id,
+                }
             )
+            self.remote_agents[sender] = conn.conn_id
+            self.remote_directory[sender] = (entry, conn.conn_id)
             self._broadcast_to_peers(
                 conn,
                 "registered",
                 sender,
-                Reference(urn=sender, capabilities=list(conn.capabilities)),
+                local if local is not None else Reference(urn=sender, capabilities=list(conn.capabilities)),
             )
+
+    def _adopt_local_registration(self, conn: AsyncConnection) -> None:
+        from acnl_core.addresses import Reference
+
+        ref = self.directory.resolve(conn.sender)
+        if ref is None:
+            return
+        entry = self.remote_directory.get(conn.sender)
+        if entry is None or entry[1] != conn.conn_id:
+            return
+        self.remote_directory[conn.sender] = (ref.to_dict(), conn.conn_id)
+        self._broadcast_to_peers(conn, "registered", conn.sender, ref)
 
     async def _handle_request(self, conn: AsyncConnection, msg: WireMessage) -> None:
         if self.cfg.self_urn in msg.envelope.route:
@@ -376,6 +416,10 @@ class AsyncNode:
         if key in self._seen_set:
             return
         self._seen_set.add(key)
+        # bounded to the window: the deque evicts its leftmost on overflow,
+        # so drop exactly that key (the set used to grow without bound)
+        if len(self._seen) == self._seen.maxlen:
+            self._seen_set.discard(self._seen[0])
         self._seen.append(key)
         ttl = msg.envelope.ttl
         if ttl <= 1:
@@ -394,10 +438,10 @@ class AsyncNode:
         recipient = msg.envelope.recipient
         if recipient == self.cfg.self_urn:
             await self._handle_local(conn, msg)
-        elif recipient in self.conns_by_sender():
-            self._forward(conn, msg, self.conns_by_sender()[recipient])
-        elif recipient in self.remote_agents:
-            target = self.conns.get(self.remote_agents[recipient])
+        elif (target := self.conn_by_sender(recipient)) is not None:
+            self._forward(conn, msg, target)
+        elif (cid := self.remote_agents.get(recipient)) is not None:
+            target = self.conns.get(cid)
             if target is None or target.dead:
                 _err(conn, msg.envelope.sender, target_unreachable(recipient), msg.envelope.request_id)
             else:
@@ -430,7 +474,13 @@ class AsyncNode:
         ttl = float(body.get("ttl", self.cfg.directory_ttl))
         ref = self._reference_from_body(body)
         self.directory.advertise(ref.urn, ref, ttl)
-        self.remote_agents[ref.urn] = conn.conn_id
+        # a local agent advertising through its own connection must keep its
+        # own conn as the route — and the entry must reflect the advertised
+        # reference, not the hello placeholder (same race as the threaded node)
+        if self.remote_agents.get(ref.urn) == conn.conn_id:
+            self.remote_directory[ref.urn] = (ref.to_dict(), conn.conn_id)
+        else:
+            self.remote_agents[ref.urn] = conn.conn_id
         self._reply(conn, msg, body={"op": "advertise", "urn": ref.urn, "ttl": ttl})
         self._broadcast_to_peers(conn, "registered", ref.urn, ref)
 
@@ -507,7 +557,7 @@ class AsyncNode:
     # -- replies, notifications, fragments ---------------------------------
     def _handle_reply(self, conn: AsyncConnection, msg: WireMessage) -> None:
         recipient = msg.envelope.recipient
-        target = self.conns_by_sender().get(recipient)
+        target = self.conn_by_sender(recipient)
         if target is None:
             cid = self.remote_agents.get(recipient)
             target = self.conns.get(cid) if cid else None
@@ -564,7 +614,13 @@ class AsyncNode:
 
     # -- routing helpers ----------------------------------------------------
     def conns_by_sender(self) -> Dict[str, AsyncConnection]:
-        return {c.sender: c for c in self.conns.values() if c.sender}
+        # a maintained index (sender learned at hello, dropped at
+        # disconnect) — the old version scanned every connection on every
+        # request and reply
+        return dict(self._senders)
+
+    def conn_by_sender(self, sender: str) -> Optional[AsyncConnection]:
+        return self._senders.get(sender)
 
     def _forward(self, conn: AsyncConnection, msg: WireMessage, target: AsyncConnection) -> None:
         msg.envelope.route.append(self.cfg.self_urn)
@@ -638,12 +694,21 @@ class AsyncNode:
 
     def _re_advertise(self) -> None:
         ref = self.directory.resolve(self.cfg.self_urn)
-        if ref is None:
-            return
-        self.directory.advertise(self.cfg.self_urn, ref, self.cfg.directory_ttl)
-        self._broadcast_to_peers(None, "registered", self.cfg.self_urn, ref)
+        if ref is not None:
+            self.directory.advertise(self.cfg.self_urn, ref, self.cfg.directory_ttl)
+            self._broadcast_to_peers(None, "registered", self.cfg.self_urn, ref)
         for urn, d, cid in [(u, dr, c) for u, (dr, c) in self.remote_directory.items()]:
             origin = self.conns.get(cid)
             if origin is None:
                 continue
-            self._broadcast_to_peers(origin, "registered", urn, d, peers_only=True)
+            # a reference that is also local is re-sent from the local table
+            # (authoritative); the federated copy is a hello placeholder
+            # until the local advertise lands
+            local = self.directory.resolve(urn)
+            self._broadcast_to_peers(
+                origin,
+                "registered",
+                urn,
+                local.to_dict() if local is not None else d,
+                peers_only=True,
+            )
