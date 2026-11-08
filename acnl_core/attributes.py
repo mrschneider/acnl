@@ -225,7 +225,11 @@ def _resolve_attr(node_value: Any, attr: str) -> Any:
         return urn.split("/")[0].split(":", 1)[-1] if urn else None
     if attr in node_value:
         return node_value.get(attr)
-    return node_value.get("attributes", {}).get(attr)
+    attrs = node_value.get("attributes")
+    # a missing attribute resolves to None (matching the old
+    # ``.get("attributes", {}).get(attr)``) without allocating a throwaway
+    # dict on every miss — the hot path in a full-scan query
+    return None if attrs is None else attrs.get(attr)
 
 
 def _eval(node: Any, value: Any) -> bool:

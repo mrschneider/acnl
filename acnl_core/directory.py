@@ -27,6 +27,10 @@ class Entry:
     reference: Reference
     expires_at: Optional[float] = None
     registered_at: float = field(default_factory=time.time)
+    # cached wire document for queries (rebuilt on every mutation). Kept on
+    # the entry so a full-scan query stops re-allocating the dict for every
+    # reference; the value is internal — callers always get ``reference``.
+    _doc: Optional[Dict[str, Any]] = None
 
 
 class Directory(Protocol):
@@ -71,8 +75,9 @@ class InMemoryDirectory:
             if bucket is not None:
                 bucket.discard(urn)
 
-    def _add_to_index(self, urn: str, reference: Reference) -> None:
-        doc = reference.to_dict()
+    def _add_to_index(self, urn: str, reference: Reference, doc: Optional[Dict[str, Any]] = None) -> None:
+        if doc is None:
+            doc = reference.to_dict()
         contrib: List[Tuple[str, Any]] = []
         for k, v in doc.items():
             if k == "urn" or isinstance(v, (dict, list, tuple, set)):
@@ -93,8 +98,11 @@ class InMemoryDirectory:
             raise DuplicateName(urn)
         if urn in self._entries:
             self._remove_from_index(urn)
-        self._entries[urn] = Entry(urn=urn, reference=reference, expires_at=expires_at)
-        self._add_to_index(urn, reference)
+        doc = reference.to_dict()  # built once per mutation, reused by index + query
+        entry = Entry(urn=urn, reference=reference, expires_at=expires_at)
+        entry._doc = doc
+        self._entries[urn] = entry
+        self._add_to_index(urn, reference, doc)
 
     def bind(self, urn: str, reference: Reference, overwrite: bool = False) -> None:
         self._bind(urn, reference, overwrite, None)
@@ -119,12 +127,12 @@ class InMemoryDirectory:
     def query(self, ast: Any) -> List[Reference]:
         cands = self._candidates(ast)
         if cands is None:
-            return [e.reference for e in self._entries.values() if _eval(ast, e.reference.to_dict())]
+            return [e.reference for e in self._entries.values() if _eval(ast, e._doc)]
         return [
             e.reference
             for urn in cands
             if (e := self._entries.get(urn)) is not None
-            and _eval(ast, e.reference.to_dict())
+            and _eval(ast, e._doc)
         ]
 
     def _candidates(self, ast: Any) -> Optional[frozenset]:
@@ -296,6 +304,7 @@ class ShelveDirectory:
             e = self._cache[urn] if urn in self._cache else Entry(urn=urn, reference=reference)
             e.reference = reference
             e.expires_at = None
+            e._doc = reference.to_dict()  # keep the query-side cache fresh on rebind
             self._cache[urn] = e
             self._mark_dirty(urn)
 
@@ -304,6 +313,8 @@ class ShelveDirectory:
             raise ValueError(f"ttl must be positive, got {ttl}")
         with self._lock:
             self._cache[urn] = Entry(urn=urn, reference=reference, expires_at=time.time() + ttl)
+            e = self._cache[urn]
+            e._doc = reference.to_dict()
             self._mark_dirty(urn)
 
     def unbind(self, urn: str) -> None:
@@ -327,7 +338,13 @@ class ShelveDirectory:
     def query(self, ast: Any) -> List[Reference]:
         with self._lock:
             data = self._cache
-        return [e.reference for e in data.values() if _eval(ast, e.reference.to_dict())]
+        # entries loaded from disk have no cached doc yet; fall back to the
+        # (rare) recompute so a cold start is still correct
+        return [
+            e.reference
+            for e in data.values()
+            if _eval(ast, e._doc if e._doc is not None else e.reference.to_dict())
+        ]
 
     def sweep(self, now: Optional[float] = None) -> List[str]:
         now = now if now is not None else time.time()

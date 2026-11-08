@@ -5,6 +5,26 @@ All notable changes to this project are documented here. The format follows
 the protocol's own policy (R8): a different major is refused on the wire, a
 different minor is accepted as additive.
 
+## [0.4.1] — 2026-11-07
+
+### Performance
+
+- **Directory: query-side wire-doc cache** — the full-scan query path
+  called `Reference.to_dict()` once per entry (50,000 dict/list
+  allocations per query at 50k entries). The wire doc is now built once
+  per mutation (`bind`/`advertise`) and cached on the `Entry`, then
+  reused by both `InMemoryDirectory.query` and `ShelveDirectory.query`
+  (disk-loaded entries fall back to a recompute, so cold start stays
+  correct). The cache is internal — callers always receive `Reference`.
+  Full-scan 50k query (`OR` + `CONTAINS`) **~80ms -> ~57ms (~32%)**;
+  selective `'shard = 7'` query **~1.8ms -> ~1.1ms**.
+- **Attributes: no throwaway dict on miss** — `_resolve_attr` no longer
+  allocates a throwaway `{}` on every missing attribute (the hottest
+  branch of `_eval` during full-scan queries); missing attributes still
+  resolve to `None`.
+
+No API change; all 118 tests pass.
+
 ## [0.4.0] — 2026-11-01
 
 ### Performance
