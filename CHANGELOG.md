@@ -5,6 +5,34 @@ All notable changes to this project are documented here. The format follows
 the protocol's own policy (R8): a different major is refused on the wire, a
 different minor is accepted as additive.
 
+## [0.5.0] — 2026-11-12
+
+### Performance
+
+- **Codec: msgpack replaces JSON on the wire** — the frame payload is now
+  msgpack (compact, binary, self-describing) instead of JSON. Encode is
+  ~4.3x faster (6.26µs → 1.46µs/frame) and decode ~3.8x faster
+  (4.77µs → 1.25µs/frame), with wire payloads ~20% smaller (223B → 177B
+  median). The payload layout is unchanged (u32 BE length + payload); only
+  the serialization under the length prefix changes.
+  - **Backward compatible** — `FrameDecoder` auto-detects the payload format
+    per frame by sniffing the first byte (msgpack fixmap/fixstr tags vs JSON
+    `{`/`[`), so a peer on a prior build still interoperates on both legs.
+    `encode_frame` always emits msgpack; JSON is retained only as a decode
+    fallback. `test_bad_json_refused` still holds: a raw JSON buffer like
+    `b"not json"` is rejected as bad JSON, not bad msgpack.
+  - `msgpack` is now a runtime dependency (stdlib-only builds still work
+    if the import is skipped, but the encode path requires it).
+
+- **Experiments** — added `experiments/profile_bench.py` (per-frame profiling
+  of encode/decode and the envelope path) and `experiments/compare_codec.py`
+  (before/after msgpack benchmark). p50 end-to-end async ping (N=128) moves
+  from ~37.6ms down to ~28–32ms; the codec is no longer the dominant cost,
+  so the next candidates are `parse_urn`/`valid_urn` caching and the
+  `OR+CONTAINS@50k` query path.
+
+All 118 tests pass.
+
 ## [0.4.1] — 2026-11-07
 
 ### Performance

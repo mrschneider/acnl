@@ -28,8 +28,11 @@ across each other.
 
 - **Addressing:** `acnl:<zone>/<node>/<agent>` — a hierarchical URN.
 - **Reference:** `acnl://<host>:<port>/<urn>` — the short form a human types.
-- **Frame:** `u32 BE length + JSON` on TCP. `MAX_FRAME = 1 MiB`. A zero-length
-  frame is refused as a bug, a hostile length is refused as a bug.
+- **Frame:** `u32 BE length + payload` on TCP. Payload is **msgpack** (fast,
+  compact, self-describing); legacy **JSON** payloads are auto-detected on
+  decode so prior builds still interoperate. `MAX_FRAME = 1 MiB`. A
+  zero-length frame is refused as a bug, a hostile length is refused as a
+  bug.
 - **Message layer:** `hello`, `request`, `reply`, `error`, `notify`, `fragment`, `close`.
 - **Operation layer:** `advertise`, `withdraw`, `resolve`, `query`, `send`, `bind`, `ping`.
 - **Errors:** `user_error` (business refusal, never retryable), `system_error`
@@ -119,6 +122,13 @@ connection-derived and die with the peer.
 - `docs/` — research, architecture, and requirements.
 
 ## Quickstart
+
+Install (msgpack is a runtime dependency; `cryptography` is optional for
+encryption):
+
+```bash
+pip install acnl[security]
+```
 
 ```python
 from acnl_core.directory import InMemoryDirectory
