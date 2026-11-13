@@ -1,12 +1,17 @@
 // Cross-language E2E: a Node.js client drives a Python ACNL node.
 // Proves the wire contract is language-neutral: framing (u32 BE length +
-// JSON), the seven wire kinds, the seven-operation closed vocabulary,
+// msgpack), the seven wire kinds, the seven-operation closed vocabulary,
 // envelope validation, and the typed error taxonomy all behave identically
 // from a second implementation.
 //
-// Run: python experiments/run_e2e.py
+// The Python node speaks msgpack by default (with JSON auto-detected for
+// legacy peers); this client sends JSON (auto-detected by the server) and
+// decodes both msgpack and JSON replies, mirroring the server's sniff logic.
+//
+// Run: npm install && python experiments/run_e2e.py
 
 import net from "node:net";
+import { decode } from "@msgpack/msgpack";
 
 const HOST = "127.0.0.1";
 const PORT = parseInt(process.env.ACNL_PORT || "19710", 10);
@@ -18,6 +23,16 @@ function frame(value) {
   const head = Buffer.alloc(4);
   head.writeUInt32BE(payload.length, 0);
   return Buffer.concat([head, payload]);
+}
+
+function sniff(raw) {
+  // Mirror the Python FrameDecoder._sniff: claim msgpack only on the
+  // unambiguous fixmap/fixstr tags; everything else is JSON (legacy).
+  if (raw.length === 0) return "json";
+  const b0 = raw[0];
+  if (b0 >= 0x80 && b0 <= 0x8f) return "msgpack"; // fixmap
+  if (b0 >= 0xa0 && b0 <= 0xbf) return "msgpack"; // fixstr
+  return "json";
 }
 
 class Decoder {
@@ -34,7 +49,7 @@ class Decoder {
       if (this.buf.length < 4 + len) break;
       const raw = this.buf.subarray(4, 4 + len);
       this.buf = this.buf.subarray(4 + len);
-      out.push(JSON.parse(raw.toString("utf8")));
+      out.push(sniff(raw) === "msgpack" ? decode(raw) : JSON.parse(raw.toString("utf8")));
     }
     return out;
   }
