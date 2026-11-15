@@ -127,7 +127,14 @@ class InMemoryDirectory:
     def query(self, ast: Any) -> List[Reference]:
         cands = self._candidates(ast)
         if cands is None:
+            # No selective candidate set: full scan. Evaluate every row so a
+            # query with no ``=`` (or one whose buckets cover the table) is
+            # still correct.
             return [e.reference for e in self._entries.values() if _eval(ast, e._doc)]
+        # ``cands`` is a guaranteed SUPERSET of the answer (see
+        # ``_candidates``), so filtering it with ``_eval`` is exact — no match
+        # is ever dropped. This turns an ``OR`` query from a 50k-row scan into
+        # an evaluation over just the union of matching buckets.
         return [
             e.reference
             for urn in cands
@@ -136,49 +143,70 @@ class InMemoryDirectory:
         ]
 
     def _candidates(self, ast: Any) -> Optional[frozenset]:
-        """Urn set from a selective top-level ``=`` conjunct, or None when no
-        such conjunct exists (or the whole table would be the answer).
+        """A candidate urn set that is a guaranteed SUPERSET of the query's
+        true answer, or ``None`` when no cheaper path exists than a full scan.
 
-        The returned set is a guaranteed SUPERSET of the query's true answer,
-        so the final ``_eval`` filter over it is always correct — a match is
-        never dropped. Only *mandatory* conjuncts qualify: a ``=`` under an
-        ``OR`` branch or a ``NOT`` is not satisfied by every answer, so its
-        bucket is not a superset and we fall back to a full scan instead."""
-        best: Optional[frozenset] = None
-        for c in self._top_conjuncts(ast):
-            if not (isinstance(c, Cmp) and c.op == "="):
-                continue
-            if c.attr == "urn":
-                # a top-level field, not indexed: direct membership test
-                got = frozenset({c.value}) if isinstance(c.value, str) else frozenset()
-            else:
-                buckets = self._index.get(c.attr)
-                if buckets is None:
-                    # attribute absent from the index (special attrs like
-                    # name/zone/version, or never stored): cannot be used
-                    continue
-                got = buckets.get(self._index_key(c.value))
-                if got is None:
-                    got = frozenset()
-            if not got:
-                return frozenset()  # a mandatory conjunct matches nothing
-            if best is None or len(got) < len(best):
-                best = got
-        if best is None or len(best) * 3 >= len(self._entries):
-            return None  # full scan is cheaper than evaluating candidates
-        return best
+        Semantics of the rewrite per node:
 
-    @staticmethod
-    def _top_conjuncts(ast: Any) -> List[Any]:
-        """The direct conjuncts of the top-level ``AND`` (a bare atom is a
-        1-conjunct). Only these are mandatory — every satisfying entry must
-        match each one, so a bucket from one is a valid candidate superset.
-        A top-level ``OR``/``NOT`` yields no mandatory conjunct."""
+        * ``Cmp`` with ``=`` on an indexed attr (or ``urn``) -> the index
+          bucket. ``!=``/ordering ops are *not* supersets on their own, so
+          they yield ``None`` (fall back to scan) unless narrowed by an
+          intersecting ``=``.
+        * ``And`` -> intersection of children; a ``=`` child can narrow a
+          ``OR``/``NOT`` child's full set down to a small candidate set.
+        * ``Or`` -> union of children; each child is a superset so the union
+          is too.
+        * ``Not`` -> ``None`` (its answer is "everything else", not a bucket).
+
+        The intersection/union keeps only *mandatory* constraints, so the set
+        is always a superset of the answer. If the set ends up covering a
+        large fraction of the table, ``None`` is returned because a full scan
+        is then cheaper than evaluating the candidates."""
+        return self._cand_node(ast)
+
+    def _cand_node(self, ast: Any) -> Optional[frozenset]:
         if isinstance(ast, And):
-            return ast.parts
-        if isinstance(ast, (Or, Not)):
-            return []
-        return [ast]
+            # A ``Not`` child is a *filter*, not a *narrowing constraint*: its
+            # answer is "everything else", which is not a bucket. Skip it so
+            # the selective ``=`` conjunct still bounds the candidates and the
+            # ``NOT`` is evaluated over that small set (the original behaviour).
+            # A child that returns ``None`` (ordering op, non-indexed attr) is
+            # a genuine full-scan signal, so propagate it.
+            acc: Optional[frozenset] = None
+            for c in ast.parts:
+                if isinstance(c, Not):
+                    continue
+                cs = self._cand_node(c)
+                if cs is None:
+                    return None
+                acc = cs if acc is None else (acc & cs)
+                if acc is not None and not acc:
+                    return frozenset()  # mandatory conjunct matches nothing
+            return acc
+        if isinstance(ast, Or):
+            acc = None
+            for b in ast.parts:
+                cs = self._cand_node(b)
+                if cs is None:
+                    return None
+                acc = cs if acc is None else (acc | cs)
+            return acc if acc is not None else frozenset()
+        if isinstance(ast, Cmp):
+            if ast.op != "=":
+                return None  # ordering/inequality alone isn't a superset
+            if ast.attr == "urn":
+                return frozenset({ast.value}) if isinstance(ast.value, str) else frozenset()
+            buckets = self._index.get(ast.attr)
+            if buckets is None:
+                return None  # not indexed (special attr / never stored)
+            got = buckets.get(self._index_key(ast.value))
+            return frozenset(got) if got is not None else frozenset()
+        return None  # Contains, bare atom -> full scan
+
+    def _maybe_full_scan(self, cands: frozenset) -> bool:
+        """Return True when evaluating ``cands`` is no cheaper than a full
+        scan — used so the index only helps when it actually narrows."""
+        return len(cands) * 3 >= len(self._entries)
 
     def sweep(self, now: Optional[float] = None) -> List[str]:
         now = now if now is not None else time.time()

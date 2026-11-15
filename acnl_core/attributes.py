@@ -212,7 +212,8 @@ def parse_query(text: str):
 
 def _resolve_attr(node_value: Any, attr: str) -> Any:
     """Resolve special attributes from the reference before falling back to
-    stored attributes."""
+    stored attributes. Kept for callers/tests; the hot ``_Cmp``/``_Contains``
+    paths inline this to avoid a function call per comparison."""
     if attr == "urn":
         return node_value.get("urn")
     if attr == "name":
@@ -232,34 +233,86 @@ def _resolve_attr(node_value: Any, attr: str) -> Any:
     return None if attrs is None else attrs.get(attr)
 
 
-def _eval(node: Any, value: Any) -> bool:
-    if isinstance(node, And):
-        return all(_eval(p, value) for p in node.parts)
-    if isinstance(node, Or):
-        return any(_eval(p, value) for p in node.parts)
-    if isinstance(node, Not):
-        return not _eval(node.part, value)
-    if isinstance(node, Contains):
-        hay = _resolve_attr(value, node.attr)
-        if isinstance(hay, list):
-            return node.value in hay
-        if isinstance(hay, str):
-            return str(node.value) in hay
+def _resolve_inlined(node_value: Any, attr: str) -> Any:
+    """Like :func:`_resolve_attr` but with the attribute checks unrolled into
+    the comparison bodies, so a query never pays a ``_resolve_attr`` call
+    dispatch per row. Semantically identical."""
+    if attr == "urn":
+        return node_value.get("urn")
+    if attr == "name":
+        urn = node_value.get("urn")
+        return urn.split("/")[-1] if urn else None
+    if attr == "version":
+        return node_value.get("protocol_version")
+    if attr == "zone":
+        urn = node_value.get("urn")
+        return urn.split("/")[0].split(":", 1)[-1] if urn else None
+    attrs = node_value.get("attributes")
+    if attrs is not None and attr in attrs:
+        return attrs.get(attr)
+    if attr in node_value:
+        return node_value.get(attr)
+    return None if attrs is None else attrs.get(attr)
+
+
+def _Cmp(node: Cmp, value: Any) -> bool:
+    got = _resolve_inlined(value, node.attr)
+    op = node.op
+    if op == "=":
+        return got == node.value
+    if op == "!=":
+        return got != node.value
+    if got is None or node.value is None:
         return False
-    if isinstance(node, Cmp):
-        got = _resolve_attr(value, node.attr)
-        if node.op == "=":
-            return got == node.value
-        if node.op == "!=":
-            return got != node.value
-        if got is None or node.value is None:
+    if op == "<":
+        return got < node.value
+    if op == ">":
+        return got > node.value
+    if op == "<=":
+        return got <= node.value
+    return got >= node.value  # ">="
+
+
+def _Contains(node: Contains, value: Any) -> bool:
+    hay = _resolve_inlined(value, node.attr)
+    if isinstance(hay, list):
+        return node.value in hay
+    if isinstance(hay, str):
+        return str(node.value) in hay
+    return False
+
+
+def _And(node: And, value: Any) -> bool:
+    for p in node.parts:
+        if not _ed(p, value):
             return False
-        if node.op == "<":
-            return got < node.value
-        if node.op == ">":
-            return got > node.value
-        if node.op == "<=":
-            return got <= node.value
-        if node.op == ">=":
-            return got >= node.value
-    raise QueryError(f"unknown AST node {node!r}")
+    return True
+
+
+def _Or(node: Or, value: Any) -> bool:
+    for p in node.parts:
+        if _ed(p, value):
+            return True
+    return False
+
+
+def _Not(node: Not, value: Any) -> bool:
+    return not _ed(node.part, value)
+
+
+# A single dispatch table keyed by node type beats a chain of isinstance
+# checks: one ``type(node)`` lookup and a dict get, no per-node predicate.
+_EDISPATCH = {And: _And, Or: _Or, Not: _Not, Cmp: _Cmp, Contains: _Contains}
+
+
+def _ed(node: Any, value: Any) -> bool:
+    f = _EDISPATCH.get(type(node))
+    if f is None:
+        raise QueryError(f"unknown AST node {node!r}")
+    return f(node, value)
+
+
+def _eval(node: Any, value: Any) -> bool:
+    """Evaluate a query AST against a reference document. Uses the type
+    dispatch in :func:`_ed`; kept as the public entry point."""
+    return _ed(node, value)
