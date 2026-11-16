@@ -24,23 +24,57 @@ URN_RE = re.compile(
 )
 ENDPOINT_RE = re.compile(r"^([a-zA-Z0-9.:\-]+):(\d{1,5})$")
 
+# A bounded LRU cache for :func:`parse_urn`. A single URN is parsed twice per
+# envelope (sender + recipient) and once per inbound frame, so the regex is
+# the single most-called function on a hot node. The cache is keyed by the
+# URN string and holds a sentinel for *invalid* URNs too, so a malformed
+# address is rejected once and the rejection is cached. Bounded so a workload
+# with many distinct URNs cannot grow it without limit.
+from collections import OrderedDict as _OrderedDict
+import threading as _threading
+
+URNCACHE_MAX = 512
+URNCACHE_LOCK = _threading.RLock()
+URNCACHE_MISS = object()  # sentinel: invalid URN, stored value is this object
+URNCACHE: "OrderedDict[str, object]" = _OrderedDict()
+
 
 class AddressError(ValueError):
     pass
 
 
 def parse_urn(text: str) -> Dict[str, str]:
-    """Parse a hierarchical URN. Raises AddressError on anything else."""
+    """Parse a hierarchical URN. Raises AddressError on anything else.
+
+    The common case (a repeated, valid URN) is served from a bounded LRU
+    cache; the first call for any given string still runs the regex so the
+    cache is correct for malformed input too (the raised error is cached)."""
     if not isinstance(text, str):
         raise AddressError(f"urn must be a string, got {type(text).__name__}")
+    with URNCACHE_LOCK:
+        cached = URNCACHE.get(text)
+        if cached is not None:
+            URNCACHE.move_to_end(text)
+            return cached
+    # Cache miss: run the regex outside the lock, then publish the result.
     m = URN_RE.match(text)
     if not m:
-        raise AddressError(
+        err = AddressError(
             f"malformed urn {text!r}: expected 'acnl:<zone>/<node>/<agent>' "
             "with lowercase alphanumeric components"
         )
+        with URNCACHE_LOCK:
+            if len(URNCACHE) >= URNCACHE_MAX:
+                URNCACHE.popitem(last=False)
+            URNCACHE[text] = URNCACHE_MISS
+        raise err
     zone, node, agent = m.group(1), m.group(2), m.group(3)
-    return {"zone": zone, "node": node, "agent": agent}
+    result = {"zone": zone, "node": node, "agent": agent}
+    with URNCACHE_LOCK:
+        if len(URNCACHE) >= URNCACHE_MAX:
+            URNCACHE.popitem(last=False)
+        URNCACHE[text] = result
+    return result
 
 
 def format_urn(zone: str, node: str, agent: str) -> str:

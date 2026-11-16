@@ -15,6 +15,7 @@ anything else needs a translator per pair of frameworks.
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -176,7 +177,7 @@ class WireMessage:
 
 
 def new_id() -> str:
-    return uuid.uuid4().hex[:24]
+    return os.urandom(18).hex()
 
 
 def make_envelope(sender: str, recipient: str, **kwargs) -> Envelope:

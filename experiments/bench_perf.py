@@ -146,6 +146,11 @@ def bench_query():
         hits2 = d.query(ast2)
     t_or = (time.perf_counter() - t0) / 20 * 1000
     print(f"query@50k: 'shard = 7'={t_eq:7.3f}ms ({len(hits)} hits)  OR+CONTAINS={t_or:7.3f}ms ({len(hits2)} hits)")
+    # correctness: compiled evaluator must match the interpreter on every row
+    from acnl_core.attributes import _eval, _compile
+    compiled = _compile(ast2)
+    assert all(_eval(ast2, e._doc) == compiled(e._doc) for e in d._entries.values())
+    assert all(e.reference in hits2 for e in d._entries.values() if _eval(ast2, e._doc))
 
 if __name__ == "__main__":
     bench_client_latency()

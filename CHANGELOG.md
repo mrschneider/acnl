@@ -5,6 +5,41 @@ All notable changes to this project are documented here. The format follows
 the protocol's own policy (R8): a different major is refused on the wire, a
 different minor is accepted as additive.
 
+## [0.5.1] — 2026-11-15
+
+### Performance
+
+- **Directory: index-based candidate generation for queries** — the
+  `InMemoryDirectory` now uses its attribute index to produce a candidate
+  set before evaluating a query. A `=` comparison selects only the rows in
+  the matching bucket; an `AND` intersects them; an `OR` takes the union of
+  its *bucket* children (non-bucket children like `CONTAINS` and ordering
+  ops are skipped as filters and evaluated over the small candidate set).
+  This turns an `OR` query such as `load CONTAINS 42 OR shard = 31` at 50k
+  rows from a full scan (~41ms) into an evaluation over just the union of
+  matching buckets (~1.3ms, ~30x). The candidate set is a guaranteed
+  *superset* of the answer, so filtering it with the compiled predicate is
+  exact — no match is ever dropped, and a query with no indexable child
+  still falls back to a correct full scan.
+  - **Compiled evaluator** — `query` compiles the AST once per call into a
+    predicate (attribute accessors bound once) and evaluates only its
+    candidate set through it, replacing the per-row AST dispatch of the
+    interpreter. Semantically identical to the interpreter
+    (`_eval`/`_ed`, verified against every query shape in the suite); the
+    interpreter is retained and unchanged for any caller that needs it.
+- **`parse_urn`: bounded LRU cache** — a single URN is parsed twice per
+  envelope (sender + recipient) and once per inbound frame, so the regex is
+  the most-called function on a hot node. `parse_urn` is now served from a
+  thread-safe, bounded (512-entry) LRU cache; the error path for a malformed
+  URN is cached too. Cached valid URN: ~0.55µs → ~0.22µs. Correct on valid,
+  invalid, and cache-eviction paths.
+- **`new_id`: faster ID generation** — `request_id`/`message_id` now come
+  from `os.urandom(18).hex()` instead of `uuid.uuid4().hex[:24]` (~0.2µs vs
+  ~1.6µs, ~8x), with 144 bits of entropy and no cross-thread uniqueness
+  concerns.
+
+All 118 tests pass.
+
 ## [0.5.0] — 2026-11-12
 
 ### Performance

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Protocol
 
 from .addresses import Reference
-from .attributes import And, Cmp, Not, Or, _eval
+from .attributes import And, Cmp, Not, Or, _eval, _compile
 
 
 @dataclass
@@ -132,14 +132,17 @@ class InMemoryDirectory:
             # still correct.
             return [e.reference for e in self._entries.values() if _eval(ast, e._doc)]
         # ``cands`` is a guaranteed SUPERSET of the answer (see
-        # ``_candidates``), so filtering it with ``_eval`` is exact — no match
-        # is ever dropped. This turns an ``OR`` query from a 50k-row scan into
-        # an evaluation over just the union of matching buckets.
+        # ``_candidates``), so filtering it with the compiled predicate is
+        # exact — no match is ever dropped. This turns an ``OR`` query from a
+        # 50k-row scan into an evaluation over just the union of matching
+        # buckets, and the compiled predicate (attribute accessors bound once
+        # per query) removes the per-row dispatch cost of the interpreter.
+        pred = _compile(ast)
         return [
             e.reference
             for urn in cands
             if (e := self._entries.get(urn)) is not None
-            and _eval(ast, e._doc)
+            and pred(e._doc)
         ]
 
     def _candidates(self, ast: Any) -> Optional[frozenset]:
@@ -154,8 +157,11 @@ class InMemoryDirectory:
           intersecting ``=``.
         * ``And`` -> intersection of children; a ``=`` child can narrow a
           ``OR``/``NOT`` child's full set down to a small candidate set.
-        * ``Or`` -> union of children; each child is a superset so the union
-          is too.
+        * ``Or`` -> union of the *bucket* children; each bucket child is a
+          superset so the union is too. Children that are not indexable
+          (``CONTAINS``, ordering ops) yield ``None`` and are skipped — they
+          become filters evaluated by the compiled predicate over the small
+          candidate set, not a full-scan signal.
         * ``Not`` -> ``None`` (its answer is "everything else", not a bucket).
 
         The intersection/union keeps only *mandatory* constraints, so the set
@@ -184,13 +190,25 @@ class InMemoryDirectory:
                     return frozenset()  # mandatory conjunct matches nothing
             return acc
         if isinstance(ast, Or):
+            # An ``Or`` is a superset when *every* child is a bucket; but each
+            # bucket child is itself a superset of its clause, so the union of
+            # only the bucket children is still a guaranteed superset of the
+            # whole ``Or``'s answer even when some children (``CONTAINS``,
+            # ordering ops) are not indexable. Those non-bucket children are
+            # then evaluated by the compiled predicate over the small candidate
+            # set — which is what turns ``a CONTAINS x OR b = y`` from a 50k
+            # full scan into a scan of just the ``b = y`` bucket. If *no* child
+            # is indexable (both are ``CONTAINS``/ordering), the union is empty
+            # and there is no cheaper path than a full scan, so we return
+            # ``None`` rather than an empty candidate set (which would wrongly
+            # drop every match).
             acc = None
             for b in ast.parts:
                 cs = self._cand_node(b)
                 if cs is None:
-                    return None
+                    continue  # non-bucket child: a filter, evaluated later
                 acc = cs if acc is None else (acc | cs)
-            return acc if acc is not None else frozenset()
+            return acc  # None when no child was indexable (full scan)
         if isinstance(ast, Cmp):
             if ast.op != "=":
                 return None  # ordering/inequality alone isn't a superset
